@@ -369,7 +369,8 @@ cd "/Users/beng003/Documents/正式工作/工具/发票合并小助手"
 | `启动.command` | 双击用本机 Python 环境启动图形界面 |
 | `selftest.py` | 自检脚本，构造样本并校验合并结果，含界面冒烟 |
 | `示例输出/` | 演示用的合并结果、报告与源文件 |
-| `build_app/` | 打包用素材：应用图标 `AppIcon.icns` 与 PyInstaller 配置 `发票合并小助手.spec` |
+| `build_app/` | 打包用素材：macOS 图标与 spec（`AppIcon.icns` / `发票合并小助手.spec`）、Windows 图标与 spec（`AppIcon.ico` / `InvoiceMerge-win.spec`） |
+| `.github/workflows/build_windows.yml` | Windows exe 云端构建工作流（GitHub Actions，推送 main 自动触发） |
 | `README.md` | 本文件 |
 
 界面用 PySide6 实现，核心逻辑留在 `invoice_merge.py` 里 —— 两边靠 `Options` / `MergeReport`
@@ -412,6 +413,18 @@ cd "/Users/beng003/Documents/正式工作/工具/发票合并小助手"
 - 图标通过 `spec` 的 `datas` 打进去（`assets/` → `Contents/Resources/assets/`）。
   换了图标或加了新图标，要重新打包才生效。
 - 加了 PySide6 后体积从 86 MB 涨到约 145 MB，多出来的基本都是 Qt 的库和插件。
+
+### 打包 Windows exe
+
+PyInstaller 不支持跨平台编译，Windows exe 由 GitHub Actions 在 `windows-latest` 上构建：
+
+- 工作流：`.github/workflows/build_windows.yml`（推送到 main 自动触发，也可在 Actions 页手动触发）。
+- 打包配置：`build_app/InvoiceMerge-win.spec`（onedir、窗口模式，图标 `build_app/AppIcon.ico`）。
+- 产物：构建页的工件 `InvoiceMerge_Windows.zip`，解压后双击 `发票合并小助手.exe` 运行；
+  整个文件夹可单独拷走（绿色版，不需要安装任何依赖）。
+- 首次运行若被 SmartScreen 拦下，点「更多信息 → 仍要运行」，只需一次。
+- 注意：`.gitignore` 里排除构建产物的规则要写成 `/build/` 这种根锚定形式，
+  写成 `build*/` 会把 `build_app/`（spec 与图标）一并排除，导致 CI 找不到 spec。
 
 ---
 
