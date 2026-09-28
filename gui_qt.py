@@ -598,6 +598,9 @@ class MainWindow(QWidget):
         self.last_report: Optional[core.MergeReport] = None
         self.analyzer: Optional[AnalyzeWorker] = None
         self.worker: Optional[MergeWorker] = None
+        # 输出路径字段里"我们自动填的那个值"。字段内容等于它（或为空）才允许
+        # 随文件列表刷新；用户手输 / 另存为选过的路径要原样留着。
+        self._auto_output = ""
         # 记下每个按钮的图标名与配色角色，切主题时批量换色
         self._icon_bindings: List[Tuple[QPushButton, str, str]] = []
 
@@ -762,37 +765,35 @@ class MainWindow(QWidget):
     def _build_options(self) -> QWidget:
         frame, outer = make_card("选项")
 
-        # 输出尺寸：5 个选项一行放不下，拆成两行；左侧标签独立成列，避免被网格压扁
+        # 输出尺寸：两个选项排一行；左侧标签独立成列，避免被网格压扁
         self.size_buttons = {}
-        size_rows = QVBoxLayout()
-        size_rows.setSpacing(8)
-        for group in (core.SIZE_ORDER[:3], core.SIZE_ORDER[3:]):
-            line = QHBoxLayout()
-            line.setSpacing(20)
-            for mode in group:
-                rb = QRadioButton(core.SIZE_LABELS[mode])
-                self.size_buttons[mode] = rb
-                line.addWidget(rb)
-            line.addStretch(1)
-            size_rows.addLayout(line)
+        size_line = QHBoxLayout()
+        size_line.setSpacing(20)
+        for mode in core.SIZE_ORDER:
+            rb = QRadioButton(core.SIZE_LABELS[mode])
+            self.size_buttons[mode] = rb
+            size_line.addWidget(rb)
+        size_line.addStretch(1)
         # 默认：统一 A4 纵向（横向页旋转填满）
         self.size_buttons[core.SIZE_A4_ROTATE].setChecked(True)
 
         size_box = QHBoxLayout()
         size_box.setSpacing(16)
-        size_box.addWidget(field_label("输出尺寸"), 0, Qt.AlignTop)
-        size_box.addLayout(size_rows, 1)
+        size_box.addWidget(field_label("输出尺寸"), 0, Qt.AlignVCenter)
+        size_box.addLayout(size_line, 1)
         outer.addLayout(size_box)
 
-        # 处理开关：6 个开关分两行，每行 3 个
+        # 处理开关：7 个开关分两行
         self.chk_organize = QCheckBox("整理报销顺序")
-        self.chk_hotel = QCheckBox("酒店发票上半拼版")
+        self.chk_band = QCheckBox("小票拼版（酒店 / 机票 / 其他）")
         self.chk_autorot = QCheckBox("自动扶正横躺内容")
         self.chk_fixclip = QCheckBox("恢复被裁切内容")
         self.chk_report = QCheckBox("生成报告")
         self.chk_recursive = QCheckBox("包含子文件夹")
-        switches = (self.chk_organize, self.chk_hotel, self.chk_autorot,
-                    self.chk_fixclip, self.chk_report, self.chk_recursive)
+        self.chk_scan = QCheckBox("输出为扫描件（300dpi）")
+        switches = (self.chk_organize, self.chk_band, self.chk_autorot,
+                    self.chk_fixclip, self.chk_report, self.chk_recursive,
+                    self.chk_scan)
         for chk in switches:
             chk.setChecked(chk is not self.chk_recursive)
 
@@ -830,7 +831,8 @@ class MainWindow(QWidget):
         outer.addLayout(out_row)
 
         hint = QLabel(
-            "整理顺序：酒店发票 → 差旅费报销单 → 火车 / 飞机票据 → 其他材料 → 票据粘贴单封面")
+            "整理顺序：酒店发票 → 差旅费报销单 → 火车 / 飞机票据 → 其他材料 → 票据粘贴单封面\n"
+            "拼版：酒店 / 机票两张一页，其他材料三张一转一页，带间画裁切虚线便于裁剪")
         hint.setObjectName("hint")
         outer.addWidget(hint)
         return frame
@@ -906,13 +908,29 @@ class MainWindow(QWidget):
         self.last_report = None
         self.btn_reveal.setEnabled(False)
         self.btn_print.setEnabled(False)
-        if not self.path_edit.text().strip():
-            self.path_edit.setText(str(core.default_output_path(
-                self.files, base_dir.name if base_dir else None)))
+        self._sync_output_path(base_dir)
         self._refresh_table()
         self.start_analysis()
 
+    def _sync_output_path(self, base_dir: Optional[Path] = None) -> None:
+        """输出路径跟着当前材料走，别留在上一次那个文件夹里。
+
+        只在"用户没动过这个字段"时刷新：内容为空、或还是上次自动填的那个值。
+        手输过、另存为选过的路径保留不动。
+        """
+        current = self.path_edit.text().strip()
+        if current and current != self._auto_output:
+            return
+        if not self.files:
+            self._auto_output = ""
+            self.path_edit.setText("")
+            return
+        self._auto_output = str(core.default_output_path(
+            self.files, base_dir.name if base_dir else None))
+        self.path_edit.setText(self._auto_output)
+
     def _refresh_table(self) -> None:
+        opts = self._options()
         self.table.setRowCount(len(self.files))
         for r, f in enumerate(self.files):
             si = self.infos.get(f)
@@ -926,7 +944,7 @@ class MainWindow(QWidget):
                 if len(sizes) > 2:
                     size_txt += " 等"
                 notes = []
-                if si.category == core.CATEGORY_HOTEL and self.chk_hotel.isChecked():
+                if core.band_applies(si.category, opts):
                     notes.append("拼版")
                 if any(p.clipped for p in si.pages):
                     notes.append("需恢复裁切")
@@ -976,6 +994,7 @@ class MainWindow(QWidget):
         self.files = []
         self.infos = {}
         self.last_report = None
+        self._sync_output_path(None)
         self._refresh_table()
         self.btn_reveal.setEnabled(False)
         self.btn_print.setEnabled(False)
@@ -1059,9 +1078,10 @@ class MainWindow(QWidget):
         ready = [si for si in (self.infos.get(f) for f in self.files) if si and si.ok]
         if ready:
             pages = sum(si.page_count for si in ready)
-            hotel = sum(si.page_count for si in ready
-                        if si.category == core.CATEGORY_HOTEL and self.chk_hotel.isChecked())
-            self.status_label.setText("待合并 %d 页" % ((pages - hotel) + (hotel + 1) // 2))
+            out_pages = core.estimate_output_pages(ready, self._options())
+            self.status_label.setText(
+                "待合并 %d 页" % out_pages if out_pages == pages
+                else "拼版后 %d 页（输入 %d）" % (out_pages, pages))
 
     # ---------- 选项 ----------
 
@@ -1082,7 +1102,8 @@ class MainWindow(QWidget):
             output=Path(out).expanduser() if out else None,
             write_report=self.chk_report.isChecked(),
             organize=self.chk_organize.isChecked(),
-            hotel_merge=self.chk_hotel.isChecked(),
+            band_merge=self.chk_band.isChecked(),
+            scan_output=self.chk_scan.isChecked(),
         )
 
     # ---------- 合并 ----------
@@ -1154,6 +1175,7 @@ class MainWindow(QWidget):
         path, _ = QFileDialog.getSaveFileName(
             self, "保存合并结果", str(Path(start) / initial.name), "PDF 文件 (*.pdf)")
         if path:
+            self._auto_output = ""       # 手动选过，之后换材料就不再自动改
             self.path_edit.setText(path)
             self._remember_dir(path)
 

@@ -194,6 +194,49 @@ def describe(rows: List[dict]) -> str:
     return " | ".join(parts)
 
 
+def keep_disables_band_note(win) -> bool:
+    """选「保持原始尺寸」后，表格笔记列不该再出现「拼版」。用完还原界面。"""
+    path = Path("酒店发票笔记测试.pdf")
+    si = im.SourceInfo(path=path, page_count=1,
+                       pages=[im.PageInfo(source=path, page_no=0,
+                                          vis_w=A4_W, vis_h=A4_H)],
+                       category=im.CATEGORY_HOTEL)
+    win.files, win.infos = [path], {path: si}
+    try:
+        win.chk_band.setChecked(True)
+        win.size_buttons[im.SIZE_A4_ROTATE].setChecked(True)
+        win._refresh_table()
+        banded = "拼版" in win.table.item(0, 5).text()
+        win.size_buttons[im.SIZE_KEEP].setChecked(True)
+        win._refresh_table()
+        return banded and "拼版" not in win.table.item(0, 5).text()
+    finally:
+        win.size_buttons[im.SIZE_A4_ROTATE].setChecked(True)
+        win.files, win.infos = [], {}
+        win._refresh_table()
+
+
+def output_path_follows_folder(workdir: Path, select, get_path, set_path) -> List[bool]:
+    """换文件夹后输出路径要跟着走；用户手输过的路径要保留。
+
+    select(文件列表) 只驱动"选文件 → 刷新输出路径"这一段，不起分析线程。
+    目录必须真实存在 —— default_output_path 会把不存在的父目录退回主目录。
+    """
+    files = []
+    for name in ("甲", "乙", "丙"):
+        d = workdir / ("输出路径" + name)
+        d.mkdir(exist_ok=True)
+        files.append(d / ("出差%s.pdf" % name))
+    select([files[0]])
+    first = get_path().startswith(str(files[0].parent))
+    select([files[1]])
+    second = get_path().startswith(str(files[1].parent))
+    manual = str(workdir / "手工指定.pdf")
+    set_path(manual)
+    select([files[2]])
+    return [first, second, get_path() == manual]
+
+
 # --------------------------------------------------------------------------
 # 用例
 # --------------------------------------------------------------------------
@@ -213,7 +256,7 @@ def main() -> int:
     print("-" * 70)
     print("用例 A：保真模式（默认），文件夹输入，自然排序")
     print("-" * 70)
-    opts = im.Options(size_mode=im.SIZE_KEEP, sort_mode=im.SORT_NATURAL,
+    opts = im.Options(scan_output=False, size_mode=im.SIZE_KEEP, sort_mode=im.SORT_NATURAL,
                       auto_rotate=True, fix_clipping=True,
                       output=workdir / "A_保真模式.pdf", write_report=True)
     files = im.sort_paths(im.list_pdfs(samples), opts.sort_mode)
@@ -249,40 +292,6 @@ def main() -> int:
           [f.name for f in files].index("发票2.pdf") < [f.name for f in files].index("发票10.pdf"))
     check("A15 生成了合并报告", rep.report_path is not None and rep.report_path.exists())
 
-    # ================= 用例 B：统一 A4 =================
-    print()
-    print("-" * 70)
-    print("用例 B：统一 A4（按内容方向自动选横纵）")
-    print("-" * 70)
-    opts_b = im.Options(size_mode=im.SIZE_A4_AUTO, sort_mode=im.SORT_NATURAL,
-                        auto_rotate=True, fix_clipping=True,
-                        output=workdir / "B_统一A4.pdf")
-    rep_b = im.merge_pdfs(files, opts_b, log=lambda m: print("   " + m))
-    rows_b = inspect(rep_b.output) if rep_b.ok else []
-    print("   输出：%s" % describe(rows_b))
-    check("B1 合并成功", rep_b.ok)
-    check("B2 共 8 页", len(rows_b) == 8, "实际 %d" % len(rows_b))
-    a4_ok = all(
-        (abs(r["w"] - A4_W) < 2 and abs(r["h"] - A4_H) < 2) or
-        (abs(r["w"] - A4_H) < 2 and abs(r["h"] - A4_W) < 2)
-        for r in rows_b
-    )
-    check("B3 每页均为 A4 尺寸（横或纵）", a4_ok, describe(rows_b))
-    check("B4 纵向源页 -> A4 纵向", not rows_b[0]["landscape"])
-    check("B5 横向源页 -> A4 横向", rows_b[1]["landscape"])
-    check("B6 内容横躺页扶正后为 A4 横向", rows_b[3]["landscape"], describe(rows_b[3:4]))
-    check("B7 所有页文字水平", all(r["angle"] in (0, None) for r in rows_b),
-          str([r["angle"] for r in rows_b]))
-    # 内容未被裁切：墨迹应完整落在页面内且不过度留白
-    inside = True
-    for r in rows_b:
-        if r["ink"] is None:
-            continue
-        x0, y0, x1, y1 = r["ink"]
-        if x0 < -1 or y0 < -1 or x1 > r["w"] + 1 or y1 > r["h"] + 1:
-            inside = False
-    check("B8 内容完整落在页面内（无裁切）", inside)
-
     # ================= 用例 C：单独指定文件 + 关闭自动扶正 =================
     print()
     print("-" * 70)
@@ -290,7 +299,7 @@ def main() -> int:
     print("-" * 70)
     picked = [samples / "01_纵向电子发票.pdf", samples / "04_内容横躺.pdf",
               samples / "02_横向发票.pdf"]
-    opts_c = im.Options(size_mode=im.SIZE_KEEP, sort_mode=im.SORT_NAME,
+    opts_c = im.Options(scan_output=False, size_mode=im.SIZE_KEEP, sort_mode=im.SORT_NAME,
                         auto_rotate=False, fix_clipping=True,
                         output=workdir / "C_不扶正.pdf")
     rep_c = im.merge_pdfs(picked, opts_c, log=lambda m: print("   " + m))
@@ -333,8 +342,9 @@ def main() -> int:
     print("-" * 70)
     print("用例 F：统一 A4 纵向 + 横向内容旋转（横向材料转 90° 填满纸面）")
     print("-" * 70)
-    opts_f = im.Options(size_mode=im.SIZE_A4_ROTATE, sort_mode=im.SORT_NATURAL,
-                        fix_clipping=True, output=workdir / "F_纵向旋转.pdf")
+    opts_f = im.Options(scan_output=False, size_mode=im.SIZE_A4_ROTATE, sort_mode=im.SORT_NATURAL,
+                        fix_clipping=True, band_merge=False,
+                        output=workdir / "F_纵向旋转.pdf")
     rep_f = im.merge_pdfs(files, opts_f, log=lambda m: print("   " + m))
     rows_f = inspect(rep_f.output) if rep_f.ok else []
     print("   输出：%s" % describe(rows_f))
@@ -342,23 +352,21 @@ def main() -> int:
     check("F2 每页均为 A4 纵向",
           bool(rows_f) and all(abs(r["w"] - A4_W) < 2 and abs(r["h"] - A4_H) < 2 for r in rows_f),
           describe(rows_f))
-    check("F3 横向源页（02）转成竖躺姿态，文字角度 270",
-          len(rows_f) > 1 and rows_f[1]["angle"] == 270, "角度=%s" % (rows_f[1]["angle"] if len(rows_f) > 1 else "N/A"))
+    check("F3 横向源页（02）转成竖躺姿态，文字角度 90（内容顶部朝右）",
+          len(rows_f) > 1 and rows_f[1]["angle"] == 90, "角度=%s" % (rows_f[1]["angle"] if len(rows_f) > 1 else "N/A"))
     check("F4 rotation 属性异常的横向页（03）同样转成竖躺",
-          len(rows_f) > 2 and rows_f[2]["angle"] == 270, "角度=%s" % (rows_f[2]["angle"] if len(rows_f) > 2 else "N/A"))
+          len(rows_f) > 2 and rows_f[2]["angle"] == 90, "角度=%s" % (rows_f[2]["angle"] if len(rows_f) > 2 else "N/A"))
     check("F5 纵向源页（01）保持文字水平",
           len(rows_f) > 0 and rows_f[0]["angle"] == 0)
     check("F6 内容横躺页（04）在该模式下被扶正为水平",
           len(rows_f) > 3 and rows_f[3]["angle"] == 0, "角度=%s" % (rows_f[3]["angle"] if len(rows_f) > 3 else "N/A"))
 
-    # 关闭开关时不应再有旋转行为（用 a4-portrait 对照）
-    opts_f2 = im.Options(size_mode=im.SIZE_A4_PORTRAIT, sort_mode=im.SORT_NATURAL,
-                         fix_clipping=True, output=workdir / "F2_纵向居中.pdf")
-    rep_f2 = im.merge_pdfs(files, opts_f2, log=lambda m: None)
-    rows_f2 = inspect(rep_f2.output) if rep_f2.ok else []
-    check("F7 对照：缩小居中模式保持文字水平",
-          len(rows_f2) > 1 and rows_f2[1]["angle"] == 0,
-          "角度=%s" % (rows_f2[1]["angle"] if len(rows_f2) > 1 else "N/A"))
+    # 关掉扫描件开关时，内容应当完整落在 A4 纸面内、不被裁掉
+    inside = [r["no"] for r in rows_f
+              if r["ink"] is not None and (
+                  r["ink"][0] < -1 or r["ink"][1] < -1
+                  or r["ink"][2] > r["w"] + 1 or r["ink"][3] > r["h"] + 1)]
+    check("F7 内容完整落在 A4 页面内（无裁切）", not inside, "越界页 %s" % inside)
 
     # ================= 用例 G：拼音排序 =================
     print()
@@ -384,10 +392,10 @@ def main() -> int:
           [f.name for f in im.sort_paths(files, im.SORT_NATURAL)].index("发票2.pdf")
           < [f.name for f in im.sort_paths(files, im.SORT_NATURAL)].index("发票10.pdf"))
 
-    # ================= 用例 H：报销顺序整理 + 酒店票拼版 =================
+    # ================= 用例 H：报销顺序整理 + 多材料拼版 =================
     print()
     print("-" * 70)
-    print("用例 H：报销顺序整理与酒店发票上半页拼版")
+    print("用例 H：报销顺序整理与酒店 / 机票 / 其他材料拼版")
     print("-" * 70)
     biz = workdir / "报销"
     biz.mkdir(exist_ok=True)
@@ -419,8 +427,8 @@ def main() -> int:
         return texts
 
     biz_files = im.sort_paths(im.list_pdfs(biz), im.SORT_PINYIN)
-    opts_h = im.Options(size_mode=im.SIZE_KEEP, sort_mode=im.SORT_PINYIN,
-                        organize=True, hotel_merge=True,
+    opts_h = im.Options(scan_output=False, size_mode=im.SIZE_A4_ROTATE, sort_mode=im.SORT_PINYIN,
+                        organize=True, band_merge=True,
                         output=workdir / "H_报销整理.pdf")
     rep_h = im.merge_pdfs(biz_files, opts_h, log=lambda m: print("   " + m))
     check("H1 合并成功", rep_h.ok)
@@ -429,36 +437,151 @@ def main() -> int:
     for i, t in enumerate(texts, 1):
         print("     P%d  %s" % (i, t[:46]))
 
-    check("H2 两张酒店发票拼成一页，总页数 7", len(texts) == 7, "实际 %d 页" % len(texts))
+    def cut_lines(path, page_no: int) -> List[float]:
+        """取某页上所有裁切虚线的 y 坐标（横向、贯穿大半个纸面）。"""
+        doc = fitz.open(str(path))
+        out_y: List[float] = []
+        try:
+            for it in doc[page_no].get_drawings():
+                r = it["rect"]
+                if not it.get("dashes") or it["items"][0][0] != "l":
+                    continue
+                if r.height < 1 and r.width > doc[page_no].rect.width * 0.6:
+                    out_y.append(round(r.y0, 1))
+        finally:
+            doc.close()
+        return sorted(out_y)
+
+    check("H2 酒店 / 机票 / 其他材料各自拼版，总页数 5", len(texts) == 5,
+          "实际 %d 页" % len(texts))
     check("H3 首位是酒店发票拼版页（含两张，且不含结账单）",
           len(texts) > 0 and "桔子水晶酒店" in texts[0] and "海滨酒店" in texts[0]
           and "结账单" not in texts[0],
           texts[0][:44] if texts else "")
-    check("H4 第二位是差旅费报销单",
-          len(texts) > 1 and "差旅费报销单" in texts[1])
-    check("H5 第三位是机票行程单", len(texts) > 2 and "行程单" in texts[2])
-    check("H6 第四位是火车票", len(texts) > 3 and ("铁路" in texts[3] or "火车" in texts[3]))
-    check("H7 酒店结账单归入其他材料（排在票据之后，不参与拼版）",
-          len(texts) > 4 and "结账单" in texts[4], texts[4][:40] if len(texts) > 4 else "")
-    check("H8 票据粘贴单封面排在最后",
+    check("H4 第二位是差旅费报销单（不拼版，独占一页）",
+          len(texts) > 1 and "差旅费报销单" in texts[1] and "铁路" not in texts[1])
+    check("H5 机票行程单与火车票拼在同一页",
+          len(texts) > 2 and "行程单" in texts[2] and ("铁路" in texts[2] or "火车" in texts[2]),
+          texts[2][:44] if len(texts) > 2 else "")
+    check("H6 酒店结账单与出差说明同属其他材料，拼在同一页",
+          len(texts) > 3 and "结账单" in texts[3] and "出差情况说明" in texts[3],
+          texts[3][:44] if len(texts) > 3 else "")
+    check("H7 票据粘贴单封面排在最后",
           len(texts) > 0 and "票据粘贴单" in texts[-1])
-    check("H9 酒店发票只占半页（页面高度不变，内容各占上下半区）",
+    check("H8 酒店发票只占半页（页面高度不变，内容各占上下半区）",
           rep_h.ok and all(abs(r["h"] - A4_H) < 2 for r in inspect(rep_h.output)))
+    check("H9 每张拼版页都画了裁切虚线，两拼一页只有一条",
+          rep_h.ok and all(len(cut_lines(rep_h.output, i)) == 1 for i in (0, 2, 3)),
+          str([len(cut_lines(rep_h.output, i)) for i in (0, 2, 3)] if rep_h.ok else "无输出"))
+    check("H10 不拼版的整页材料上没有虚线",
+          rep_h.ok and not cut_lines(rep_h.output, 1) and not cut_lines(rep_h.output, 4))
 
     # 关掉拼版 → 页数应恢复为 8
-    opts_h2 = im.Options(size_mode=im.SIZE_KEEP, organize=True, hotel_merge=False,
+    opts_h2 = im.Options(scan_output=False, size_mode=im.SIZE_KEEP, organize=True, band_merge=False,
                          output=workdir / "H2_不拼版.pdf")
     rep_h2 = im.merge_pdfs(biz_files, opts_h2, log=lambda m: None)
-    check("H10 关闭拼版后各材料各占一页，共 8 页",
+    check("H11 关闭拼版后各材料各占一页，共 8 页",
           rep_h2.ok and rep_h2.written_pages == 8, "实际 %d" % rep_h2.written_pages)
 
+    # 保持原始尺寸 → 拼版让位于保真，页数不变
+    opts_hk = im.Options(scan_output=False, size_mode=im.SIZE_KEEP, organize=True, band_merge=True,
+                         output=workdir / "H4_保真不拼版.pdf")
+    rep_hk = im.merge_pdfs(biz_files, opts_hk, log=lambda m: None)
+    check("H11b 保持原始尺寸下不拼版，仍是 8 页",
+          rep_hk.ok and rep_hk.written_pages == 8, "实际 %d" % rep_hk.written_pages)
+
     # 关掉整理 → 顺序应回到拼音序
-    opts_h3 = im.Options(size_mode=im.SIZE_KEEP, organize=False, hotel_merge=True,
+    opts_h3 = im.Options(scan_output=False, size_mode=im.SIZE_KEEP, organize=False, band_merge=True,
                          sort_mode=im.SORT_PINYIN, output=workdir / "H3_不整理.pdf")
     rep_h3 = im.merge_pdfs(biz_files, opts_h3, log=lambda m: None)
     texts3 = page_texts(rep_h3.output) if rep_h3.ok else []
-    check("H11 关闭整理后按拼音序排列（首页不是酒店）",
+    check("H12 关闭整理后按拼音序排列（首页不是酒店）",
           bool(texts3) and "酒店" not in texts3[0], texts3[0][:30] if texts3 else "")
+
+    # ================= 用例 T：其他材料三合一旋转 =================
+    print()
+    print("-" * 70)
+    print("用例 T：其他材料三张一转拼一页，第四张单独成页")
+    print("-" * 70)
+    tiny = workdir / "其他材料三合一"
+    tiny.mkdir(exist_ok=True)
+    for i in range(1, 5):
+        doc = fitz.open()
+        pg = doc.new_page(width=A4_W, height=A4_H)
+        y = 70.0
+        while y < 270.0:                      # 铺成竖长一条，才谈得上"转过来更划算"
+            pg.insert_text((60, y), "结账单 明细行 项目 %d-%.0f" % (i, y),
+                           fontsize=12, fontname="china-s")
+            y += 22.0
+        pg.insert_text((60, 300), "编号 NO-000%d" % i, fontsize=12, fontname="china-s")
+        doc.save(str(tiny / ("结账单%d.pdf" % i)))
+        doc.close()
+
+    def vertical_share(path, page_no: int) -> float:
+        """该页上竖排（旋转过的）文字占多少比例。"""
+        doc = fitz.open(str(path))
+        tot = vert = 0
+        try:
+            for blk in doc[page_no].get_text("dict").get("blocks", []):
+                if blk.get("type") != 0:
+                    continue
+                for line in blk.get("lines", []):
+                    n = len("".join(s.get("text", "") for s in line["spans"]).strip())
+                    if not n:
+                        continue
+                    tot += n
+                    if abs(line["dir"][0]) < 0.1:
+                        vert += n
+        finally:
+            doc.close()
+        return vert / float(tot) if tot else 0.0
+
+    opts_t = im.Options(scan_output=False, size_mode=im.SIZE_A4_ROTATE, organize=True, band_merge=True,
+                        output=workdir / "T_三合一.pdf")
+    tiny_files = im.sort_paths(im.list_pdfs(tiny), im.SORT_NATURAL)
+    rep_t = im.merge_pdfs(tiny_files[:3], opts_t, log=lambda m: None)
+    check("T1 三份其他材料合成一页", rep_t.ok and rep_t.written_pages == 1,
+          "实际 %s" % (rep_t.written_pages if rep_t.ok else rep_t.error))
+    if rep_t.ok:
+        ys = cut_lines(rep_t.output, 0)
+        check("T2 三等分产生两条裁切虚线", len(ys) == 2, str(ys))
+        check("T3 虚线等距落在 1/3、2/3 处",
+              all(abs(y - A4_H * k / 3) < 2 for k, y in zip((1, 2), ys)), str(ys))
+        check("T4 竖版内容被转成横躺（顶部朝右）",
+              vertical_share(rep_t.output, 0) > 0.9,
+              "竖排占比 %.0f%%" % (vertical_share(rep_t.output, 0) * 100))
+        _dt = fitz.open(str(rep_t.output))
+        _txt = _dt[0].get_text()
+        _dt.close()
+        check("T5 三份内容都在", all(("NO-000%d" % i) in _txt for i in (1, 2, 3)))
+
+    rep_t4 = im.merge_pdfs(tiny_files, im.Options(scan_output=False,
+        size_mode=im.SIZE_A4_ROTATE, organize=True, band_merge=True,
+        output=workdir / "T4_四份.pdf"), log=lambda m: None)
+    check("T6 第四份不硬塞，单独占一页（3+1）",
+          rep_t4.ok and rep_t4.written_pages == 2, "实际 %s" % rep_t4.written_pages)
+    check("T7 落单那份不缩小（竖排占比为 0）",
+          rep_t4.ok and vertical_share(rep_t4.output, 1) == 0.0)
+
+    check("T8 电子登机凭证归其他材料而非交通票据",
+          im.classify_document("个人登机凭证 (1).pdf")[0] == im.CATEGORY_OTHER)
+    check("T9 出差申请审批单归其他材料",
+          im.classify_document("汕头出差.pdf", "国核信息-出差申请审批单")[0]
+          == im.CATEGORY_OTHER)
+    check("T10 真机票仍归交通票据，不被登机凭证规则误伤",
+          im.classify_document("机票行程单.pdf")[0] == im.CATEGORY_TRAVEL)
+
+    # 单页旋转路径（差旅费报销单 / 封面）与拼版路径（其他材料）的摆向必须一致，
+    # 否则整本材料翻着看时方向会跳。
+    rep_l = im.merge_pdfs([samples / "02_横向发票.pdf"], im.Options(scan_output=False,
+        size_mode=im.SIZE_A4_ROTATE, band_merge=False,
+        output=workdir / "T_横版单页.pdf"), log=lambda m: None)
+    ang_l = ang_b = None
+    if rep_l.ok:
+        _dl = fitz.open(str(rep_l.output)); ang_l = display_angle(_dl[0]); _dl.close()
+    _db = fitz.open(str(rep_t.output)); ang_b = display_angle(_db[0]); _db.close()
+    check("T11 单页旋转与拼版旋转摆向一致（内容顶部同侧朝右）",
+          rep_l.ok and ang_l == ang_b == 90, "单页=%s 拼版=%s" % (ang_l, ang_b))
 
     # ================= 用例 I：打印接口 =================
     print()
@@ -621,6 +744,18 @@ def main() -> int:
             app_k2.last_dir = Path("/不存在的目录/xyz")
             check("K5 记录失效时安全回退到可用目录",
                   Path(app_k2._dialog_dir()).is_dir(), app_k2._dialog_dir())
+
+            def tk_select(fs, app=app_k2):
+                app.files = fs
+                app.base_dir = None
+                app._sync_output_path()
+
+            got_k = output_path_follows_folder(
+                workdir, tk_select, lambda: app_k2.var_output.get(),
+                lambda v: app_k2.var_output.set(v))
+            check("K6 换文件夹后输出路径跟着换，不会写回上一个文件夹",
+                  got_k[0] and got_k[1], str(got_k))
+            check("K7 手输过的输出路径不被新材料覆盖", got_k[2], str(got_k))
             root_k2.destroy()
     finally:
         if backup is None:
@@ -649,13 +784,37 @@ def main() -> int:
             check("L2 界面上默认选中「统一 A4 纵向（横向页旋转填满）」",
                   win.size_buttons[im.SIZE_A4_ROTATE].isChecked(),
                   im.SIZE_LABELS[im.SIZE_A4_ROTATE])
+            check("L2b 输出尺寸只剩两项，「推荐」落在 a4-rotate 上",
+                  list(win.size_buttons) == [im.SIZE_KEEP, im.SIZE_A4_ROTATE]
+                  and "推荐" in im.SIZE_LABELS[im.SIZE_A4_ROTATE]
+                  and "推荐" not in im.SIZE_LABELS[im.SIZE_KEEP],
+                  " / ".join(im.SIZE_LABELS[m] for m in win.size_buttons))
             check("L3 界面选项映射到 Options 时尺寸正确",
                   win._options().size_mode == im.SIZE_A4_ROTATE,
                   win._options().size_mode)
             check("L4 关键控件齐备",
                   all(hasattr(win, n) for n in
                       ("table", "btn_run", "btn_cancel", "btn_reveal", "btn_print",
-                       "progress", "log", "sort_combo", "path_edit", "count_label")))
+                       "progress", "log", "sort_combo", "path_edit", "count_label",
+                       "chk_band")))
+            check("L4b 拼版开关默认开且映射到 Options",
+                  win.chk_band.isChecked() and win._options().band_merge is True)
+            check("L4c 切到「保持原始尺寸」时表格不再标注拼版",
+                  keep_disables_band_note(win),
+                  "选中保持原始尺寸后笔记列仍出现「拼版」")
+
+            def qt_select(fs, w=win):
+                w.files = fs
+                w._sync_output_path()
+
+            got_l = output_path_follows_folder(
+                workdir, qt_select, lambda: win.path_edit.text(),
+                lambda v: win.path_edit.setText(v))
+            check("L4d 换文件夹后输出路径跟着换，不会写回上一个文件夹",
+                  got_l[0] and got_l[1], str(got_l))
+            check("L4e 手输过的输出路径不被新材料覆盖", got_l[2], str(got_l))
+            win.files, win.infos = [], {}
+            win.path_edit.setText("")
             check("L5 Lucide 图标可加载并着色",
                   not gui_qt.icon("play", gui_qt.C.ICON).isNull(),
                   "assets/icons/play.svg")
@@ -751,7 +910,7 @@ def main() -> int:
     make_landscape_hotel("酒店A.pdf", "26112000003833356171")
     make_landscape_hotel("酒店B.pdf", "26112000003869656831")
 
-    opts_n = im.Options(size_mode=im.SIZE_A4_ROTATE, organize=True, hotel_merge=True,
+    opts_n = im.Options(scan_output=False, size_mode=im.SIZE_A4_ROTATE, organize=True, band_merge=True,
                         output=workdir / "N_酒店完整.pdf")
     rep_n = im.merge_pdfs(im.sort_paths(im.list_pdfs(hotel_dir), im.SORT_PINYIN),
                           opts_n, log=lambda m: print("   " + m))
@@ -773,6 +932,62 @@ def main() -> int:
     check("N4 两张票的号码都在",
           "26112000003833356171" in merged_text and "26112000003869656831" in merged_text,
           "号码缺失" if merged_text else "无文本")
+
+    # ================= 用例 P：输出为扫描件 =================
+    print()
+    print("-" * 70)
+    print("用例 P：默认输出为扫描件（整页图片、无文字层）")
+    print("-" * 70)
+
+    def scan_profile(path):
+        """返回 (页数, 每页图片数, 首图宽, 首图高, 首页文字数, 首页尺寸)。"""
+        doc = fitz.open(str(path))
+        pg = doc[0]
+        imgs = pg.get_images(full=True)
+        w = h = 0
+        if imgs:
+            info = doc.extract_image(imgs[0][0])
+            w, h = info["width"], info["height"]
+        prof = (doc.page_count, len(imgs), w, h, len(pg.get_text().strip()),
+                (round(pg.rect.width, 1), round(pg.rect.height, 1)))
+        doc.close()
+        return prof
+
+    opts_p = im.Options(size_mode=im.SIZE_A4_ROTATE, organize=True,
+                        output=workdir / "P_扫描件.pdf")
+    check("P1 默认就是扫描件（Options 默认值）",
+          opts_p.scan_output is True and opts_p.scan_dpi == 300)
+    rep_p = im.merge_pdfs(biz_files, opts_p, log=lambda m: None)
+    prof = scan_profile(rep_p.output) if rep_p.ok else None
+    check("P2 合并成功且页数不变", rep_p.ok and prof and prof[0] == rep_h.written_pages,
+          str(prof[0]) if prof else rep_p.error)
+    check("P3 每页就是一张整页图片", bool(prof) and prof[1] == 1, "每页图片数 %s" % (prof[1] if prof else "-"))
+    check("P4 没有文字层", bool(prof) and prof[4] == 0, "文字 %d 字" % (prof[4] if prof else -1))
+    check("P5 分辨率约 300dpi（A4 宽 2480 上下）",
+          bool(prof) and abs(prof[2] - A4_W / 72 * 300) <= 3, "%dx%d" % (prof[2], prof[3]) if prof else "-")
+    check("P6 纸张尺寸仍是 A4 纵向，没被改小",
+          bool(prof) and abs(prof[5][0] - A4_W) < 1 and abs(prof[5][1] - A4_H) < 1,
+          str(prof[5]) if prof else "-")
+
+    rep_v = im.merge_pdfs(biz_files, im.Options(
+        size_mode=im.SIZE_A4_ROTATE, organize=True, scan_output=False,
+        output=workdir / "P_矢量.pdf"), log=lambda m: None)
+    prof_v = scan_profile(rep_v.output) if rep_v.ok else None
+    check("P7 关掉开关则保留文字层的矢量输出",
+          bool(prof_v) and prof_v[4] > 0 and prof_v[1] == 0,
+          "文字 %d 字 / 图片 %d 张" % (prof_v[4], prof_v[1]) if prof_v else rep_v.error)
+
+    rep_low = im.merge_pdfs(biz_files, im.Options(
+        size_mode=im.SIZE_A4_ROTATE, organize=True, scan_dpi=150,
+        output=workdir / "P_150dpi.pdf"), log=lambda m: None)
+    prof_low = scan_profile(rep_low.output) if rep_low.ok else None
+    check("P8 分辨率可调（150dpi 约 1240 宽）",
+          bool(prof_low) and abs(prof_low[2] - A4_W / 72 * 150) <= 3,
+          "%dx%d" % (prof_low[2], prof_low[3]) if prof_low else "-")
+    size_300 = rep_p.output.stat().st_size if rep_p.ok else 0
+    size_150 = rep_low.output.stat().st_size if rep_low.ok else 0
+    check("P9 低分辨率确实更小（给体积留了退路）", 0 < size_150 < size_300,
+          "150dpi %s / 300dpi %s" % (im.human_size(size_150), im.human_size(size_300)))
 
     # ================= 用例 O：深色 / 浅色主题 =================
     print()

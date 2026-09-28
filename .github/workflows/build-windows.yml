@@ -1,0 +1,37 @@
+name: build-windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install pymupdf numpy pyinstaller PySide6-Essentials
+
+      - name: Build exe
+        run: pyinstaller --noconfirm --clean "build_app/发票合并小助手-win.spec"
+
+      - name: Smoke test CLI
+        run: dist/发票合并小助手/发票合并小助手.exe --help
+
+      - name: Zip dist folder
+        shell: pwsh
+        run: Compress-Archive -Path "dist/发票合并小助手/*" -DestinationPath "dist/发票合并小助手-Windows.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: InvoiceMerge-Windows
+          path: dist/发票合并小助手-Windows.zip
+          retention-days: 30

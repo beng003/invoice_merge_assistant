@@ -12,14 +12,17 @@
 
 核心保证
 --------
-1. 默认按"保真"方式逐页复制（PyMuPDF insert_pdf），不改动原始内容，
+1. 内部按"保真"方式逐页复制（PyMuPDF insert_pdf），不改动原始内容，
    不重新压缩图像、不丢失文字层，因此不存在旋转或裁切导致的失真。
-2. 每一页的输出方向各自判定：源页视觉上是横向就输出横向页，纵向就输出纵向页。
+2. 尺寸策略只有两种：默认「统一 A4 纵向（横向页旋转填满）」，或「保持原始尺寸」
+   逐页沿用原方向原大小。
 3. 若页面被 CropBox 裁掉了内容，自动把裁剪框扩回内容范围（不超出 MediaBox）。
 4. 若内容在页面里是横躺的，按需旋转页面扶正。
-5. 统一尺寸模式下用 contain 方式居中缩放，绝不拉伸变形、绝不裁切。
+5. 缩放一律用 contain 方式居中放置，绝不拉伸变形、绝不裁切。
 6. "统一 A4 纵向（横向页旋转填满）"模式把横向材料整体转 90° 后填满纸面，
    与人工粘贴报销凭证的习惯一致；纵向材料不受影响。
+7. 默认在写盘前把整份输出转成扫描件（每页一张 300dpi 整页图片，无文字层），
+   等同打印再扫回去；要保留矢量与文字层用 --no-scan 或取消界面上的勾选。
 """
 
 from __future__ import annotations
@@ -72,25 +75,21 @@ A4_W, A4_H = 595.276, 841.89          # A4 纵向，单位 pt
 MM = 72.0 / 25.4                       # 1 毫米对应的 pt
 
 SIZE_KEEP = "keep"                     # 保持每页原始尺寸与方向
-SIZE_A4_AUTO = "a4"                    # 统一 A4，按每页内容方向自动选横 / 纵
-SIZE_A4_PORTRAIT = "a4-portrait"       # 统一 A4 纵向，横向页缩小居中
 SIZE_A4_ROTATE = "a4-rotate"           # 统一 A4 纵向，横向页内容旋转 90° 填满
-SIZE_LARGEST = "largest"               # 统一到所有页中最大的尺寸
 
 SIZE_LABELS = {
-    SIZE_KEEP: "保持原始尺寸（推荐）",
-    SIZE_A4_AUTO: "统一 A4（自动横 / 纵）",
-    SIZE_A4_ROTATE: "统一 A4 纵向（横向页旋转填满）",
-    SIZE_A4_PORTRAIT: "统一 A4 纵向（横向页缩小居中）",
-    SIZE_LARGEST: "统一为最大页尺寸",
+    SIZE_KEEP: "保持原始尺寸",
+    SIZE_A4_ROTATE: "统一 A4 纵向（横向页旋转填满）（推荐）",
 }
 
 # 尺寸策略的排列顺序，GUI 与命令行共用
-SIZE_ORDER = (SIZE_KEEP, SIZE_A4_AUTO, SIZE_A4_ROTATE, SIZE_A4_PORTRAIT, SIZE_LARGEST)
+SIZE_ORDER = (SIZE_KEEP, SIZE_A4_ROTATE)
 
-# 横向页在"旋转填满"模式下统一转到的文字角度：内容顶部朝左，
-# 打印后把纸顺时针转 90° 即可正常阅读。
-PORTRAIT_TEXT_ANGLE = 270
+# 横向页在"旋转填满"模式下统一转到的文字角度：内容顶部朝右，与拼版路径
+# 的 BAND_ROTATE 摆向一致 —— 整本材料转着看的方向才是统一的。
+# 注意这是「文本书写角度」，和 show_pdf_page 的 rotate 参数不是同一套记法，
+# 两者数值相同不代表摆向相同，别顺手把它们合并成一个常量。
+PORTRAIT_TEXT_ANGLE = 90
 
 SORT_NATURAL = "natural"               # 自然排序：发票2 排在 发票10 前面
 SORT_PINYIN = "pinyin"                 # 中文按拼音，拉丁 / 数字开头的排在中文之后
@@ -140,12 +139,34 @@ CATEGORY_KEYWORDS = (
 # 会把上一次的合并结果再合并一遍。
 OUTPUT_MARKERS = ("_合并_", "发票合并_", "_报告")
 
-# 酒店出具的消费明细，不是税务发票 —— 归「其他材料」，不做上半页拼版。
+# 酒店出具的消费明细，不是税务发票 —— 归「其他材料」，不按酒店那样固定两张一页。
 # 必须优先判定：这类单据正文里通常写着酒店名称，否则会被酒店关键词命中。
 SETTLEMENT_HINTS = ("结账单", "结帐单", "消费明细", "账单明细")
 
-# 酒店发票拼版：每页只取上半部分，让两张合占一页
-HOTEL_HALF_RATIO = 0.5
+# 同样归「其他材料」的单据：电子登机凭证只是乘机时打出来的 A4 纸，
+# 出差申请审批单是流程单据，都不是票据本身。必须早于火车 / 飞机关键词判定，
+# 否则"登机"会被交通关键词抢走。
+OTHER_DOC_HINTS = ("登机凭证", "登机牌", "boarding pass", "出差申请", "出差审批")
+
+# 拼版（band 排版）策略：把小材料各占纸张的一条横向区域，多张合排到一张纸上。
+# 取值 = (最少条带, 最多条带, 允许旋转)。
+# 酒店发票与机票 / 火车票固定两张一页；其他材料三张一页，且竖版单据转 90°
+# 横躺进带子里成像更大 —— 同样一份 A4 竖版单据，横过来比硬塞着不转大约一成半。
+BAND_POLICIES: Dict[str, Tuple[int, int, bool]] = {
+    CATEGORY_HOTEL: (2, 2, False),
+    CATEGORY_TRAVEL: (2, 2, False),
+    CATEGORY_OTHER: (1, 3, True),
+}
+
+# 内容转 90° 后「顶部朝右」，与人工把竖版单据横贴在报销单上的方向一致
+BAND_ROTATE = 270
+
+# 每条带四周的呼吸空间：内容不贴边、不压虚线。相邻两份材料之间因此空出
+# 2 倍的距离，裁切虚线正好走在这条通道的正中，下剪子不会碰到字。
+BAND_INSET_MM = 6.0
+BAND_LINE_COLOR = (0.42, 0.42, 0.42)
+BAND_LINE_WIDTH = 0.7
+BAND_LINE_DASHES = "[4 3] 0"
 
 INK_THRESHOLD = 245                    # 灰度低于该值视为有内容
 EDGE_TOL = 2.0                         # 内容距页边小于该值(pt)视为贴边
@@ -268,12 +289,14 @@ class Options:
     auto_rotate: bool = True            # 识别到内容横躺时自动扶正
     fix_clipping: bool = True           # 自动恢复被 CropBox 裁掉的内容
     recursive: bool = False             # 文件夹模式是否含子目录
-    margin_mm: float = 0.0              # 统一尺寸模式下的四周留白（毫米）
+    margin_mm: float = 0.0              # 四周留白（毫米）
     analysis_dpi: int = 72              # 内容检测的渲染精度
     output: Optional[Path] = None
     write_report: bool = True
     organize: bool = True               # 按报销业务顺序整理材料
-    hotel_merge: bool = True            # 酒店发票只取上半页，两张合占一页
+    band_merge: bool = True             # 拼版：酒店 / 机票两张一纸，其他材料三张一转一纸
+    scan_output: bool = True            # 输出为扫描件：整页转图片，不留文字层
+    scan_dpi: int = 300                 # 扫描件分辨率，300 对应 A4 上 2480x3508
     auto_print: bool = False            # 合并完成后直接送打印
     printer: Optional[str] = None       # 目标打印机，None 表示系统默认
     print_copies: int = 1
@@ -381,14 +404,22 @@ def classify_document(name: str, text: str = "") -> Tuple[str, str]:
     文件名和正文一起看：像"结账单20260731.pdf"这种文件名看不出用途的，
     靠正文里的"酒店"字样才能认出来。
 
-    特殊规则：**结账单是酒店出具的消费明细，不是发票**，归入「其他材料」，
-    不参与酒店发票的上半页拼版。判断时把"发票"字样排除在外，避免误伤
-    文件名里带"结账单"三个字的真发票。
+    两条前置规则：
+
+    1. **结账单是酒店出具的消费明细，不是发票**，归入「其他材料」。判断时把
+       "发票"字样排除在外，避免误伤文件名里带"结账单"三个字的真发票。
+    2. **电子登机凭证、出差申请审批单也只是 A4 单据**，同样归「其他材料」，
+       以便和结账单一起三张一转拼到一页。这条必须走在交通关键词前面，
+       否则"登机"会被火车 / 飞机那组抢走。
     """
     haystack = ("%s\n%s" % (name, text)).lower()
 
     if any(hint in haystack for hint in SETTLEMENT_HINTS) and "发票" not in haystack:
         return CATEGORY_OTHER, "结账单（非发票）"
+
+    for hint in OTHER_DOC_HINTS:
+        if hint in haystack:
+            return CATEGORY_OTHER, hint
 
     for category, words in CATEGORY_KEYWORDS:
         for word in words:
@@ -774,23 +805,12 @@ def analyze_source(path: Path, opts: Options) -> SourceInfo:
 # 合并
 # --------------------------------------------------------------------------
 
-def _target_size(info: PageInfo, opts: Options, largest: Optional[Tuple[float, float]]):
-    """在统一尺寸模式下决定该页的输出页面尺寸。"""
-    if opts.size_mode == SIZE_A4_AUTO:
-        return (A4_H, A4_W) if info.final_landscape else (A4_W, A4_H)
-    if opts.size_mode == SIZE_A4_PORTRAIT or opts.size_mode == SIZE_A4_ROTATE:
-        return (A4_W, A4_H)
-    if opts.size_mode == SIZE_LARGEST and largest:
-        return largest
-    return info.final_size
-
-
 def portrait_target_rotation(info: PageInfo) -> int:
     """在"统一 A4 纵向 + 横向内容旋转"模式下，该页应设置的 rotation。
 
-    规律：横向页的内容统一转成 PORTRAIT_TEXT_ANGLE（内容顶部朝左），
+    规律：横向页的内容统一转成 PORTRAIT_TEXT_ANGLE（内容顶部朝右），
     纵向页保持水平。这样处理与人工排版的报销材料一致 —— 横向材料
-    旋转后能填满 A4 纵向纸面，打印出来要把纸转 90° 看。
+    旋转后能填满 A4 纵向纸面，打印出来把纸转 90° 看；摆向与拼版页统一。
 
     注意这里算的是「覆盖」用的 rotation 值（set_rotation 会替换源页的
     rotation 属性，不是叠加），因此必须基于内容流的原始角度 text_angle
@@ -810,56 +830,140 @@ def _open_cached(cache: Dict[Path, object], path: Path):
     return doc
 
 
-def _hotel_page_size(info: PageInfo, opts: Options, largest) -> Tuple[float, float]:
-    """酒店发票拼版后的纸张尺寸，跟随所选尺寸策略。"""
-    if opts.size_mode == SIZE_A4_AUTO:
-        return (A4_H, A4_W) if info.landscape else (A4_W, A4_H)
-    if opts.size_mode == SIZE_LARGEST and largest:
-        return largest
-    if opts.size_mode == SIZE_KEEP:
-        return (info.vis_w, info.vis_h)
-    return (A4_W, A4_H)          # a4-rotate / a4-portrait 都输出 A4 纵向
+def _band_rects(tw: float, th: float, bands: int,
+                margin: float) -> List[fitz.Rect]:
+    """把纸张纵向等分成 bands 条，返回每条的可用区域。
+
+    每条四周留 BAND_INSET_MM（不小于页边留白 margin）的呼吸空间，相邻两条
+    因此空出两倍距离，裁切虚线正走在这条通道中间。
+    """
+    pad = max(margin, BAND_INSET_MM * MM)
+    band_h = th / bands
+    x0, x1 = pad, max(pad + 1.0, tw - pad)
+    return [fitz.Rect(x0, i * band_h + pad, x1, max(i * band_h + pad + 1.0,
+                                                    (i + 1) * band_h - pad))
+            for i in range(bands)]
 
 
-def _hotel_band(tp, ratio: float) -> Tuple[fitz.Rect, bool]:
-    """算出酒店票要放进半页的内容区域，返回 (区域, 是否缩小显示)。
+def band_policy(category: str) -> Optional[Tuple[int, int, bool]]:
+    """该类别的拼版策略 (最少条带, 最多条带, 允许旋转)；None 表示不拼版。"""
+    return BAND_POLICIES.get(category)
+
+
+def band_applies(category: str, opts: Options) -> bool:
+    """该类别在当前选项下是否真的参与拼版。
+
+    「保持原始尺寸」不参与：拼版必然要重绘并统一到一张纸上，与该选项
+    "逐页原样复制、零质量损失"的承诺冲突。
+    """
+    return bool(opts.band_merge and opts.size_mode != SIZE_KEEP
+                and band_policy(category) is not None)
+
+
+def build_units(plan: Sequence[Tuple["SourceInfo", PageInfo]],
+                opts: Options) -> List[Tuple[List[Tuple["SourceInfo", PageInfo]], int, bool]]:
+    """把待写入的页编组，返回 [(组内页面, 该页分几条带, 是否允许旋转)]。
+
+    同类材料就近凑满一张纸，不同类不混排 —— 酒店票和登机凭证对转不转的诉求
+    不一样，混在一页上裁出来的尺寸就乱了。差旅费报销单、封面各占一页。
+    """
+    units: List[Tuple[List[Tuple["SourceInfo", PageInfo]], int, bool]] = []
+    buf: List[Tuple["SourceInfo", PageInfo]] = []
+    buf_cat: Optional[str] = None
+    buf_pol: Optional[Tuple[int, int, bool]] = None
+
+    def flush() -> None:
+        nonlocal buf, buf_cat, buf_pol
+        if buf:
+            lo, _hi, rot = buf_pol
+            units.append((buf, max(lo, len(buf)), rot))
+            buf, buf_cat, buf_pol = [], None, None
+
+    for item in plan:
+        si = item[0]
+        pol = band_policy(si.category) if band_applies(si.category, opts) else None
+        if pol is None:
+            flush()
+            units.append(([item], 1, False))
+            continue
+        if buf_cat != si.category or len(buf) >= pol[1]:
+            flush()
+        buf.append(item)
+        buf_cat, buf_pol = si.category, pol
+    flush()
+    return units
+
+
+def estimate_output_pages(sources: Sequence[SourceInfo], opts: Options) -> int:
+    """按当前选项预估输出页数，供界面与 --dry-run 显示。"""
+    plan = [(si, pi) for si in sources if si.ok
+            for pi in si.pages if not pi.error]
+    return len(build_units(plan, opts)) if plan else 0
+
+
+def _place_content(page, src_doc, src_page, dst: fitz.Rect,
+                   allow_rotate: bool) -> Tuple[int, float]:
+    """把 src_page 的内容放进 page 上的 dst 条带，返回 (旋转角, 成像比例)。
 
     这里曾经按页高比例硬切，结果把横向小票切残了 —— 比如 600×400 的电子发票
     正文占满整页，切一半正好把"价税合计"那几行切掉。
 
-    正确理解是"两张发票各占纸张的一半"，而不是"把发票截掉一半"：
-    内容只落在上半的（A4 纵向发票）取到上半即可；内容占满整页的（横向小票）
-    整张缩放进半页。两种情况都不丢信息，只是后者会小一些。
+    正确理解是"几张材料各占纸张的几条带"，而不是"把发票截掉一半"：只去掉四周
+    空白，内容一律完整保留；放不下就整张缩小，只是小一点，不丢信息。竖版单据
+    横过来通常比硬塞着不转成像更大（A4 竖版进三条带约 47% 对 33%），故两种摆法取大的。
     """
-    src = tp.rect
-    ink = _ink_box(tp, 72)
+    ink = _ink_box(src_page, 72)
     if ink is None or ink.is_empty:
-        return src, False
-    band = fitz.Rect(src.x0, ink.y0, src.x1, ink.y1)
-    # 只去掉四周空白，内容一律完整保留；超过半页高度意味着会被缩小显示
-    return band, band.height > src.height * ratio
+        page.show_pdf_page(dst, src_doc, 0, keep_proportion=True)
+        return 0, 1.0
+    # 四周空白都按实际墨迹范围去掉 —— 早先只去上下、保留整页宽，
+    # 结果横向留白把内容撑成"宽扁一条"，旋转该不该转就判反了。
+    band = ink & src_page.rect
+    if band.is_empty or not band.width or not band.height:
+        page.show_pdf_page(dst, src_doc, 0, keep_proportion=True)
+        return 0, 1.0
+    rot, scale = 0, min(dst.width / band.width, dst.height / band.height)
+    if allow_rotate:
+        turn = min(dst.width / band.height, dst.height / band.width)
+        if turn > scale + 1e-6:
+            rot, scale = BAND_ROTATE, turn
+    page.show_pdf_page(dst, src_doc, 0, clip=band, keep_proportion=True, rotate=rot)
+    return rot, scale
 
 
-def _write_hotel_unit(
+def _draw_cut_lines(page, bands: int, margin: float) -> None:
+    """在相邻条带之间的通道正中画裁切虚线，两端离纸边留一段方便下剪子。"""
+    if bands < 2:
+        return
+    tw, th = page.rect.width, page.rect.height
+    inset = max(margin, BAND_INSET_MM * MM)
+    band_h = th / bands
+    for i in range(1, bands):
+        y = i * band_h
+        page.draw_line(fitz.Point(inset, y), fitz.Point(tw - inset, y),
+                       color=BAND_LINE_COLOR, width=BAND_LINE_WIDTH,
+                       dashes=BAND_LINE_DASHES)
+
+
+def _write_band_unit(
     out,
     unit: Sequence[Tuple["SourceInfo", PageInfo]],
+    bands: int,
+    allow_rotate: bool,
     opts: Options,
-    largest,
     doc_cache: Dict[Path, object],
     margin: float,
-) -> Tuple[float, float]:
-    """把 1~2 张酒店发票各取上半页，纵向拼到同一张纸上。
+) -> None:
+    """把一组小材料纵向排进同一张纸的等高条带里，条带间画裁切虚线。
 
-    第 1 张放在纸张上半，第 2 张放在下半 —— 这样两张酒店发票只占一页。
-    只有一张时同样只取上半，下半留白。
-    这里固定按页面的自然方向取上半，不套用横向页旋转规则：酒店发票本是
-    纵向材料，取上半后天然是"宽扁"的一条，正好上下叠放。
+    allow_rotate 为假时固定按页面的自然方向取内容，不套用横向页旋转 90° 的规则：
+    票据本是宽扁的一条，上下叠放正好，转成竖躺反而浪费纸。
     """
-    tw, th = _hotel_page_size(unit[0][1], opts, largest)
+    tw, th = A4_W, A4_H        # 拼版只在统一 A4 纵向模式下发生
     newpage = out.new_page(width=tw, height=th)
-    half_h = th * HOTEL_HALF_RATIO
+    rects = _band_rects(tw, th, bands, margin)
 
-    for idx, (si, pi) in enumerate(unit[:2]):
+    for idx, (si, pi) in enumerate(unit):
         doc = _open_cached(doc_cache, si.path)
         tmp = fitz.open()
         try:
@@ -869,18 +973,30 @@ def _write_hotel_unit(
                 tp.set_cropbox(fitz.Rect(*pi.new_crop))
             tp.remove_rotation()             # 烘焙旋转，坐标即以视觉呈现为准
 
-            band, shrunk = _hotel_band(tp, HOTEL_HALF_RATIO)
-            if shrunk:
-                pi.warnings.append("内容超过半页，已缩小放入半页显示")
-
-            top = idx * half_h
-            dst = fitz.Rect(margin, top + margin,
-                            max(margin + 1.0, tw - margin),
-                            max(margin + 1.0, top + half_h - margin))
-            newpage.show_pdf_page(dst, tmp, 0, clip=band, keep_proportion=True)
+            _rot, scale = _place_content(newpage, tmp, tp, rects[idx], allow_rotate)
+            if scale < 1.0 - 1e-6:
+                pi.warnings.append(
+                    "内容放不下 1/%d 页，已缩小到约 %d%%" % (bands, round(scale * 100)))
         finally:
             tmp.close()
-    return tw, th
+
+    _draw_cut_lines(newpage, bands, margin)
+
+
+def rasterize_pages(src, dpi: int):
+    """把每页整页渲染成图片后重组成新文档 —— 出来就是一份扫描件。
+
+    页面尺寸沿用源页原样，只换内容的表示方式：没有文字层、不能选中复制，
+    和打印出去再扫回来基本等价。dpi 用 300 时 A4 上是 2480x3508 像素，
+    与常见扫描仪的默认档一致。
+    """
+    out = fitz.open()
+    for page in src:
+        pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csRGB, alpha=False)
+        newpage = out.new_page(width=page.rect.width, height=page.rect.height)
+        newpage.insert_image(newpage.rect, pixmap=pix)
+        pix = None                      # 单页 RGB 位图约 26MB，尽早放手
+    return out
 
 
 def merge_pdfs(
@@ -950,34 +1066,18 @@ def merge_pdfs(
         report.error = "所有页面都无法处理"
         return report
 
-    # 编组：酒店发票两两一组拼到同一页，其余材料各占一页
-    units: List[List[Tuple[SourceInfo, PageInfo]]] = []
-    hotel_buf: List[Tuple[SourceInfo, PageInfo]] = []
-    for item in plan:
-        if opts.hotel_merge and item[0].category == CATEGORY_HOTEL:
-            hotel_buf.append(item)
-            if len(hotel_buf) == 2:
-                units.append(hotel_buf)
-                hotel_buf = []
-        else:
-            if hotel_buf:
-                units.append(hotel_buf)
-                hotel_buf = []
-            units.append([item])
-    if hotel_buf:
-        units.append(hotel_buf)
-
-    hotel_units = sum(1 for u in units if u and u[0][0].category == CATEGORY_HOTEL)
-    if opts.hotel_merge and hotel_units:
-        say("酒店发票 %d 页，按每页上半拼成 %d 页"
-            % (sum(len(u) for u in units if u and u[0][0].category == CATEGORY_HOTEL), hotel_units))
-
-    # 统一最大尺寸模式下先求全局最大
-    largest: Optional[Tuple[float, float]] = None
-    if opts.size_mode == SIZE_LARGEST:
-        largest = (max(p.final_size[0] for _s, p in plan),
-                   max(p.final_size[1] for _s, p in plan))
-        say("统一尺寸：%.0f x %.0f pt" % largest)
+    # 编组：可拼版的材料多张合排一张纸，其余材料各占一页
+    units = build_units(plan, opts)
+    if opts.band_merge:
+        banded = [u for u, bands, _r in units if bands > 1]
+        if banded:
+            counts: Dict[str, int] = {}
+            for u in banded:
+                for s, _p in u:
+                    counts[s.category] = counts.get(s.category, 0) + 1
+            say("拼版（带间已画裁切虚线）：%s，共 %d 页合排为 %d 张纸" % (
+                "、".join("%s %d 页" % (CATEGORY_LABELS[c], n) for c, n in counts.items()),
+                sum(counts.values()), len(banded)))
 
     # ---------- 2. 写入 ----------
     out = fitz.open()
@@ -986,19 +1086,22 @@ def merge_pdfs(
     total = len(units)
 
     try:
-        for order, unit in enumerate(units, 1):
+        for order, (unit, bands, allow_rotate) in enumerate(units, 1):
             if stopped():
                 report.error = "已取消"
                 break
             si, pi = unit[0]
             try:
-                if opts.hotel_merge and si.category == CATEGORY_HOTEL:
-                    # 酒店发票：每页只取上半，两张合占一页
-                    _write_hotel_unit(out, unit, opts, largest, doc_cache, margin)
+                if bands > 1:
+                    # 拼版页：每张材料占纸面一条等高带，带间画裁切虚线
+                    _write_band_unit(out, unit, bands, allow_rotate,
+                                     opts, doc_cache, margin)
                     report.written_pages += 1
                     names = " + ".join(u[0].path.name for u in unit)
                     report.actions.append(
-                        "第%d页 酒店发票拼版（各取上半）：%s" % (order, names))
+                        "第%d页 拼版（%d 张合排%s，带间裁切虚线）：%s"
+                        % (order, len(unit),
+                           "、竖版转 90°" if allow_rotate else "", names))
                     for u in unit:
                         for w in u[1].warnings:
                             report.warnings.append(
@@ -1018,38 +1121,24 @@ def merge_pdfs(
                         page.set_cropbox(fitz.Rect(*pi.new_crop))
                     if pi.fix_rotation is not None:
                         page.set_rotation(pi.fix_rotation)
-
-                    written_w = page.rect.width
-                    written_h = page.rect.height
-                    written_rot = page.rotation
                 else:
-                    # 重绘路径：先把旋转烘焙进内容，再按目标尺寸 contain 居中放置
+                    # 重绘路径：先把旋转烘焙进内容，再 contain 居中放进 A4 纵向页
                     tmp = fitz.open()
                     try:
                         tmp.insert_pdf(doc, from_page=pi.page_no, to_page=pi.page_no)
                         tp = tmp[0]
                         if pi.new_crop:
                             tp.set_cropbox(fitz.Rect(*pi.new_crop))
-
-                        if opts.size_mode == SIZE_A4_ROTATE:
-                            # 横向内容统一转成竖躺姿态，填满 A4 纵向纸面
-                            tp.set_rotation(portrait_target_rotation(pi))
-                        elif pi.fix_rotation is not None:
-                            tp.set_rotation(pi.fix_rotation)
+                        # 横向内容统一转成竖躺姿态，填满 A4 纵向纸面
+                        tp.set_rotation(portrait_target_rotation(pi))
                         # 走到这里必须烘焙，否则 show_pdf_page 会忽略 rotation 属性
                         tp.remove_rotation()
 
-                        tw, th = _target_size(pi, opts, largest)
-                        newpage = out.new_page(width=tw, height=th)
-                        dst = fitz.Rect(
-                            margin, margin,
-                            max(margin + 1.0, tw - margin),
-                            max(margin + 1.0, th - margin),
-                        )
+                        newpage = out.new_page(width=A4_W, height=A4_H)
+                        dst = fitz.Rect(margin, margin,
+                                        max(margin + 1.0, A4_W - margin),
+                                        max(margin + 1.0, A4_H - margin))
                         newpage.show_pdf_page(dst, tmp, 0, keep_proportion=True)
-                        written_w = tw
-                        written_h = th
-                        written_rot = 0
                     finally:
                         tmp.close()
 
@@ -1061,8 +1150,6 @@ def merge_pdfs(
                     acts.append("旋转扶正 %d°" % pi.fix_rotation)
                 if opts.size_mode == SIZE_A4_ROTATE:
                     acts.append("横向内容旋转 90° 填满" if pi.landscape else "置入 A4 纵向")
-                elif opts.size_mode != SIZE_KEEP:
-                    acts.append("缩放至 %.0fx%.0fpt" % (written_w, written_h))
                 if acts:
                     report.actions.append(
                         "第%d页 %s：%s" % (order, si.path.name, "、".join(acts))
@@ -1087,7 +1174,16 @@ def merge_pdfs(
             report.error = "没有成功写入任何页面"
             return report
 
-        # ---------- 3. 保存 ----------
+        # ---------- 3. 转扫描件 ----------
+        if opts.scan_output:
+            say("正在转为扫描件（%d dpi，不留文字层）…" % opts.scan_dpi)
+            scanned = rasterize_pages(out, opts.scan_dpi)
+            out.close()
+            out = scanned
+            report.actions.append("整份输出为扫描件：%d 页 @ %d dpi"
+                                 % (out.page_count, opts.scan_dpi))
+
+        # ---------- 4. 保存 ----------
         target = Path(opts.output) if opts.output else default_output_path(paths)
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -1223,6 +1319,8 @@ def _write_report(report: MergeReport, opts: Options) -> Optional[Path]:
     lines.append("输出文件：%s" % report.output)
     lines.append("文件大小：%s" % human_size(report.output_size))
     lines.append("尺寸策略：%s" % SIZE_LABELS.get(opts.size_mode, opts.size_mode))
+    lines.append("输出形式：%s" % ("扫描件（整页图片，%d dpi，无文字层）" % opts.scan_dpi
+                                  if opts.scan_output else "矢量（保留文字层）"))
     lines.append("排序方式：%s" % SORT_LABELS.get(opts.sort_mode, opts.sort_mode))
     lines.append("自动扶正：%s" % ("开" if opts.auto_rotate else "关"))
     lines.append("恢复裁切：%s" % ("开" if opts.fix_clipping else "关"))
@@ -1267,8 +1365,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python invoice_merge.py                                  # 打开图形界面\n"
             "  python invoice_merge.py --folder ~/Desktop/发票\n"
             "  python invoice_merge.py --files a.pdf b.pdf -o 合并.pdf\n"
-            "  python invoice_merge.py --folder ./发票 --size a4 --sort mtime\n"
-            "  python invoice_merge.py --folder ./发票 --size a4-rotate --sort pinyin\n"
+            "  python invoice_merge.py --folder ./发票 --size keep --sort mtime\n"
         ),
     )
     src = p.add_argument_group("输入（二选一）")
@@ -1283,19 +1380,26 @@ def build_parser() -> argparse.ArgumentParser:
     opt = p.add_argument_group("选项")
     opt.add_argument("--size", choices=list(SIZE_ORDER),
                      default=SIZE_A4_ROTATE,
-                     help="页面尺寸策略，默认 a4-rotate（统一 A4 纵向，横向页旋转填满）")
+                     help="页面尺寸策略：a4-rotate（默认，推荐）或 keep（保持原始尺寸）")
     opt.add_argument("--sort", choices=list(SORT_ORDER),
                      default=SORT_NATURAL, help="排序方式，默认 natural")
     opt.add_argument("--margin", type=float, default=0.0, metavar="MM",
-                     help="统一尺寸模式下的四周留白（毫米），默认 0")
+                     help="四周留白（毫米），默认 0")
     opt.add_argument("--no-auto-rotate", action="store_true",
                      help="关闭内容方向自动扶正")
     opt.add_argument("--no-fix-clipping", action="store_true",
                      help="关闭被裁切内容的自动恢复")
     opt.add_argument("--no-organize", action="store_true",
                      help="关闭报销顺序整理（默认按 酒店发票→报销单→火车/飞机→其他→封面 排列）")
+    opt.add_argument("--no-band-merge", action="store_true",
+                     help="关闭拼版（默认酒店发票 / 机票火车票两张一页、其他材料三张一页且竖版转 90°，"
+                          "带间画裁切虚线；--size keep 下本就不生效）")
     opt.add_argument("--no-hotel-merge", action="store_true",
-                     help="关闭酒店发票上半页拼版（默认两张合占一页）")
+                     dest="no_band_merge", help=argparse.SUPPRESS)   # 旧名，等同 --no-band-merge
+    opt.add_argument("--no-scan", action="store_true",
+                     help="不转扫描件，输出保留文字层的矢量 PDF（默认整页转成图片的扫描件）")
+    opt.add_argument("--scan-dpi", type=int, default=300, metavar="N",
+                     help="扫描件分辨率，默认 300（A4 上 2480x3508）")
 
     prt = p.add_argument_group("打印")
     prt.add_argument("--print", dest="do_print", action="store_true",
@@ -1352,7 +1456,9 @@ def run_cli(argv: Sequence[str]) -> int:
         output=Path(args.output).expanduser() if args.output else None,
         write_report=not args.no_report,
         organize=not args.no_organize,
-        hotel_merge=not args.no_hotel_merge,
+        band_merge=not args.no_band_merge,
+        scan_output=not args.no_scan,
+        scan_dpi=max(72, args.scan_dpi),
         auto_print=args.do_print,
         printer=args.printer,
         print_copies=args.copies,
@@ -1388,14 +1494,10 @@ def run_cli(argv: Sequence[str]) -> int:
             else:
                 print("  [跳过] %s  原因：%s" % (si.path.name, si.error))
 
-        hotel_pages = 0
-        if opts.hotel_merge:
-            hotel_pages = sum(si.page_count for si in infos
-                              if si.ok and si.category == CATEGORY_HOTEL)
-        out_pages = (total - hotel_pages) + (hotel_pages + 1) // 2
+        out_pages = estimate_output_pages(infos, opts)
         print("\n输入 %d 页" % total, end="")
-        if hotel_pages:
-            print("（其中酒店发票 %d 页，两张拼一页）" % hotel_pages, end="")
+        if out_pages != total:
+            print("（拼版省 %d 页）" % (total - out_pages), end="")
         print(" → 预计输出 %d 页" % out_pages)
         return 0
 
@@ -1483,8 +1585,11 @@ def _build_gui():
             self.var_fixclip = tk.BooleanVar(value=True)
             self.var_report = tk.BooleanVar(value=True)
             self.var_organize = tk.BooleanVar(value=True)
-            self.var_hotel = tk.BooleanVar(value=True)
+            self.var_band = tk.BooleanVar(value=True)
+            self.var_scan = tk.BooleanVar(value=True)
             self.var_output = tk.StringVar(value="")
+            # 输出路径框里"我们自动填的那个值"，等于它或为空时才允许随材料刷新
+            self._auto_output = ""
             self.var_status = tk.StringVar(value="请选择要合并的 PDF 文件或文件夹")
 
             self._build_widgets()
@@ -1555,8 +1660,12 @@ def _build_gui():
                 text="整理报销顺序：酒店发票 → 差旅费报销单 → 火车 / 飞机 → 其他 → 票据粘贴单封面",
             ).pack(side="left")
             ttk.Checkbutton(
-                row2b, variable=self.var_hotel, command=self._refresh_tree,
-                text="酒店发票只取上半页，两张拼一页",
+                row2b, variable=self.var_band, command=self._refresh_tree,
+                text="拼版：酒店 / 机票两张一页，其他材料三张一转一页",
+            ).pack(side="left", padx=(12, 0))
+            ttk.Checkbutton(
+                row2b, variable=self.var_scan,
+                text="输出为扫描件（整页图片 300dpi，不留文字层）",
             ).pack(side="left", padx=(12, 0))
 
             row3 = ttk.Frame(opts)
@@ -1604,7 +1713,7 @@ def _build_gui():
                     if len(sizes) > 2:
                         size_txt += " 等"
                     notes = []
-                    if si.category == CATEGORY_HOTEL and self.var_hotel.get():
+                    if band_applies(si.category, self._collect_options()):
                         notes.append("拼版")
                     if any(p.clipped for p in si.pages):
                         notes.append("需恢复裁切")
@@ -1636,11 +1745,26 @@ def _build_gui():
             self.infos.clear()
             if base_dir is not None:
                 self.base_dir = base_dir
-            if self.files and not self.var_output.get().strip():
-                self.var_output.set(str(default_output_path(self.files, self.base_dir.name if self.base_dir else None)))
+            self._sync_output_path()
             self._refresh_tree()
             self._log("已选择 %d 个文件，正在分析…" % len(self.files))
             self._start_analysis()
+
+        def _sync_output_path(self) -> None:
+            """输出路径跟着当前材料走，别留在上一次那个文件夹里。
+
+            只在"用户没动过这个框"时刷新：内容为空、或还是上次自动填的那个值。
+            """
+            current = self.var_output.get().strip()
+            if current and current != self._auto_output:
+                return
+            if not self.files:
+                self._auto_output = ""
+                self.var_output.set("")
+                return
+            self._auto_output = str(default_output_path(
+                self.files, self.base_dir.name if self.base_dir else None))
+            self.var_output.set(self._auto_output)
 
         def _dialog_dir(self) -> str:
             """文件对话框的起始目录：优先上次用过的，其次桌面。"""
@@ -1686,13 +1810,12 @@ def _build_gui():
                 messagebox.showwarning("没有找到 PDF", "该文件夹内没有 PDF 文件。\n可勾选「包含子文件夹」后重试。")
                 return
             self._set_files(pdfs, base_dir=fdir)
-            self.var_output.set(str(default_output_path(pdfs, fdir.name)))
 
         def clear_files(self) -> None:
             self.files = []
             self.infos.clear()
             self.base_dir = None
-            self.var_output.set("")
+            self._sync_output_path()
             self._refresh_tree()
             self.var_status.set("请选择要合并的 PDF 文件或文件夹")
 
@@ -1747,6 +1870,7 @@ def _build_gui():
                 filetypes=[("PDF 文件", "*.pdf")],
             )
             if path:
+                self._auto_output = ""   # 手动选过，之后换材料不再自动改
                 self.var_output.set(path)
                 self._remember_dir(path)
 
@@ -1781,7 +1905,8 @@ def _build_gui():
                 output=Path(self.var_output.get()).expanduser() if self.var_output.get().strip() else None,
                 write_report=self.var_report.get(),
                 organize=self.var_organize.get(),
-                hotel_merge=self.var_hotel.get(),
+                band_merge=self.var_band.get(),
+                scan_output=self.var_scan.get(),
             )
 
         def start_merge(self) -> None:
