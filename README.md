@@ -6,6 +6,32 @@
 
 ---
 
+## 〇、三种发布包的区别与用法
+
+同一份源码出三种成品，按用途取。下载地址：仓库 **Releases** 页
+（`https://github.com/beng003/invoice_merge_assistant/releases`），每个版本（tag）下三个文件齐全；
+本仓库根目录的 `发票合并小助手.app`、`发票合并小助手_Windows_x64.zip` 与 Release 内容一致。
+
+| 包 | 里面是什么 | 给谁用 | 怎么用 | 前提 |
+| --- | --- | --- | --- | --- |
+| `InvoiceMerge_Windows.zip` | 完整程序：`发票合并小助手.exe` + 全套运行时与依赖 | Windows 10 / 11 用户 | 解压后双击 `发票合并小助手\发票合并小助手.exe` | 无，绿色版免安装 |
+| `InvoiceMerge_MacOS.zip` | 完整程序：`发票合并小助手.app`（Apple 芯片 arm64） | macOS 用户（M 系列芯片） | 解压后在 app 图标上**右键 → 打开** | 无，双击即用 |
+| `invoice_merge_skills.zip` | AI 技能包：`SKILL.md` + `run.py` + 核心脚本 + 依赖清单 | AI 助手（WorkBuddy、Claude Code 等） | 解压到技能目录，由 agent 走命令行调用 | 一个装了 `pymupdf` 的 Python 解释器 |
+
+要点：
+
+- **前两个是给「人」用的成品程序**，图形界面、命令行、打印全都有，不需要装任何环境。
+  首次运行的放行动作各做一次：Windows 被 SmartScreen 拦下点「更多信息 → 仍要运行」；
+  mac 被拦下就右键 → 打开，或在「系统设置 → 隐私与安全性」点「仍要打开」。
+- **第三个是给「AI」用的技能包**，没有界面。解压到 `~/.workbuddy/skills/`（用户级）
+  或项目的 `.workbuddy/skills/`（项目级）之后，对话里直接说"合并这批发票"，
+  AI 会按包内 `SKILL.md` 的流程调命令行完成合并。装新机器只需验证
+  `python run.py --help` 能跑、解释器装了 `pymupdf` 即可。
+- 三种包都出自同一份 `invoice_merge.py`，合并逻辑完全一致，差别只在运行形态
+  （图形程序 vs 命令行技能）与目标平台。
+
+---
+
 ## 一、运行方式
 
 ### 1. 双击 APP（推荐，不需要任何环境）
@@ -13,7 +39,7 @@
 双击本目录下的 **`发票合并小助手.app`**。
 
 它内含完整的 Python 运行时、PyMuPDF、numpy 和 Tcl/Tk，**不依赖本机装过什么**。
-整个 app 约 86 MB，可以单独拷走，放到任何一台 Apple 芯片的 Mac 上直接双击就能用。
+整个 app 约 145 MB，可以单独拷走，放到任何一台 Apple 芯片的 Mac 上直接双击就能用。
 
 - 首次打开若被系统拦下（提示"来自身份不明的开发者"），在图标上**右键 → 打开**，
   或到「系统设置 → 隐私与安全性」里点「仍要打开」，只需一次。
@@ -362,15 +388,15 @@ cd "/Users/beng003/Documents/正式工作/工具/发票合并小助手"
 
 | 文件 | 说明 |
 | --- | --- |
-| `发票合并小助手.app` | **打包好的独立应用**，双击即用，约 145 MB，可单独拷走 |
+| `发票合并小助手.app` | macOS 独立应用（本机构建），双击即用，约 145 MB，可单独拷走 |
 | `invoice_merge.py` | 核心逻辑（PDF 处理、合并、分类、打印）+ 命令行 + 内置 Tkinter 界面 |
 | `gui_qt.py` | 图形界面（PySide6），含主题、图标、后台线程与打印对话框 |
 | `assets/icons/` | Lucide 图标（SVG），运行时按主题色着色 |
 | `启动.command` | 双击用本机 Python 环境启动图形界面 |
 | `selftest.py` | 自检脚本，构造样本并校验合并结果，含界面冒烟 |
-| `示例输出/` | 演示用的合并结果、报告与源文件 |
-| `build_app/` | 打包用素材：macOS 图标与 spec（`AppIcon.icns` / `发票合并小助手.spec`）、Windows 图标与 spec（`AppIcon.ico` / `InvoiceMerge-win.spec`） |
-| `.github/workflows/build_windows.yml` | Windows exe 云端构建工作流（GitHub Actions，推送 main 自动触发） |
+| `skills/invoice-merge/` | AI 技能包源文件（`SKILL.md`、`run.py`、`references/`）；CI 构建时自动同步核心脚本后打成 zip |
+| `build_app/` | 打包素材：图标（`AppIcon.icns` / `AppIcon.ico`）与 spec —— 本机 mac 打包用 `发票合并小助手.spec`，CI 用 `InvoiceMerge_mac.spec` / `InvoiceMerge_win.spec` |
+| `.github/workflows/` | 三个云构建工作流：`build_windows.yml` / `build_mac.yml` / `build_skills.yml`，打 `v*` tag 自动发布 Release |
 | `README.md` | 本文件 |
 
 界面用 PySide6 实现，核心逻辑留在 `invoice_merge.py` 里 —— 两边靠 `Options` / `MergeReport`
@@ -414,15 +440,22 @@ cd "/Users/beng003/Documents/正式工作/工具/发票合并小助手"
   换了图标或加了新图标，要重新打包才生效。
 - 加了 PySide6 后体积从 86 MB 涨到约 145 MB，多出来的基本都是 Qt 的库和插件。
 
-### 打包 Windows exe
+### 云端打包与自动发版（GitHub Actions）
 
-PyInstaller 不支持跨平台编译，Windows exe 由 GitHub Actions 在 `windows-latest` 上构建：
+PyInstaller 不支持跨平台编译，除上面本机打包 macOS app 外，其余成品都由 GitHub Actions 构建：
 
-- 工作流：`.github/workflows/build_windows.yml`（推送到 main 自动触发，也可在 Actions 页手动触发）。
-- 打包配置：`build_app/InvoiceMerge-win.spec`（onedir、窗口模式，图标 `build_app/AppIcon.ico`）。
-- 产物：构建页的工件 `InvoiceMerge_Windows.zip`，解压后双击 `发票合并小助手.exe` 运行；
-  整个文件夹可单独拷走（绿色版，不需要安装任何依赖）。
-- 首次运行若被 SmartScreen 拦下，点「更多信息 → 仍要运行」，只需一次。
+| 工作流 | 运行环境 | 产物 |
+| --- | --- | --- |
+| `build_windows.yml` | windows-latest | `InvoiceMerge_Windows.zip`（exe 绿色版） |
+| `build_mac.yml` | macos-latest（Apple 芯片） | `InvoiceMerge_MacOS.zip`（.app） |
+| `build_skills.yml` | ubuntu-latest | `invoice_merge_skills.zip`（技能包，构建时自动同步根目录核心脚本） |
+
+- **发版**：`git tag vX.Y.Z && git push origin vX.Y.Z`，三个工作流同时构建，
+  产物自动传到该 tag 的 Release，约 5 分钟后三件套上线。
+- **日常验证**：push 到 main 会跑 windows / skills 两个工作流（只构建不发布）；
+  mac 只在打 tag 或手动触发时构建（mac runner 计费高，省着用）。
+- CI 打包配置：`build_app/InvoiceMerge_win.spec`、`build_app/InvoiceMerge_mac.spec`
+  （SPECPATH 相对路径写法，与本机 `发票合并小助手.spec` 的绝对路径写法互不影响）。
 - 注意：`.gitignore` 里排除构建产物的规则要写成 `/build/` 这种根锚定形式，
   写成 `build*/` 会把 `build_app/`（spec 与图标）一并排除，导致 CI 找不到 spec。
 
