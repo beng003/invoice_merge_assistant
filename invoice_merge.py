@@ -56,8 +56,8 @@ except ImportError:  # 兼容旧版本的导入名
         import fitz  # type: ignore
     except ImportError:  # pragma: no cover
         sys.stderr.write(
-            "缺少依赖 PyMuPDF。请先安装：\n"
-            "    python3 -m pip install pymupdf\n"
+            "缺少依赖 PyMuPDF。请先安装（Windows 的解释器名是 python，其余是 python3）：\n"
+            "    python -m pip install pymupdf\n"
         )
         raise SystemExit(2)
 
@@ -1261,11 +1261,16 @@ def merge_pdfs(
 def list_printers() -> List[Tuple[str, bool]]:
     """列出系统里可用的打印机，返回 [(名称, 是否默认)]。
 
-    踩过的坑：macOS 的 lpstat 输出会随系统语言本地化，中文环境下打印机名
-    与后面的说明文字之间**没有空格**（如"PDFwriter正在接受请求，…"），
+    macOS / Linux 走 CUPS。踩过的坑：macOS 的 lpstat 输出会随系统语言本地化，
+    中文环境下打印机名与后面的说明文字之间**没有空格**（如"PDFwriter正在接受请求，…"），
     按空格切分取不到正确名字。所以名单改用 `lpstat -e`（每行只输出名字），
     默认机则从 `lpstat -d` 里连全角冒号一起用正则取。
+
+    Windows 没有 CUPS，改用 PowerShell 的 Win32_Printer 清单，默认机看 Default 属性。
     """
+    if sys.platform == "win32":
+        return _list_printers_win()
+
     names: List[str] = []
     try:
         r = subprocess.run(["lpstat", "-e"], capture_output=True, text=True, timeout=6)
@@ -1285,12 +1290,42 @@ def list_printers() -> List[Tuple[str, bool]]:
     return [(name, name == default) for name in names]
 
 
+def _list_printers_win() -> List[Tuple[str, bool]]:
+    """Windows 下的打印机清单：PowerShell 一行一条 `名称<TAB>是否默认`。"""
+    ps = ("[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+          "Get-CimInstance Win32_Printer | ForEach-Object "
+          '{ "{0}`t{1}" -f $_.Name, $_.Default }')
+    out = ""
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=15)
+        out = r.stdout or ""
+    except Exception:
+        pass
+    names: List[str] = []
+    default = ""
+    for ln in out.splitlines():
+        if "\t" not in ln:
+            continue
+        name, _, flag = ln.rpartition("\t")
+        name = name.strip()
+        if not name:
+            continue
+        names.append(name)
+        if not default and flag.strip().lower() == "true":
+            default = name
+    return [(name, name == default) for name in names]
+
+
 def print_pdf(path: Path, printer: Optional[str] = None,
               copies: int = 1) -> Tuple[bool, str]:
     """把 PDF 送到打印机。返回 (是否成功, 说明)。"""
     path = Path(path)
     if not path.exists():
         return False, "文件不存在：%s" % path
+    if sys.platform == "win32":
+        return _print_pdf_win(path, printer, copies)
     cmd = ["lp"]
     if printer:
         cmd += ["-d", str(printer)]
@@ -1306,6 +1341,32 @@ def print_pdf(path: Path, printer: Optional[str] = None,
     if r.returncode == 0:
         return True, (r.stdout or "").strip() or "已发送到打印机"
     return False, ((r.stderr or r.stdout) or "").strip() or "打印命令返回失败"
+
+
+def _print_pdf_win(path: Path, printer: Optional[str],
+                   copies: int) -> Tuple[bool, str]:
+    """Windows 打印：ShellExecute 的 printto / print 动词，交给 PDF 关联程序处理。
+
+    局限（Windows 体系决定的，如实告知用户）：这是"打开即打印"语义，份数传不进关联程序，
+    部分阅读器（如 Edge）没注册打印动词，会静默失败 —— 那就提示手动打印。
+    """
+    import ctypes
+
+    verb, params = ("printto", '"%s"' % printer) if printer else ("print", None)
+    try:
+        # SW_HIDE = 0；返回值 > 32 表示成功，否则是 SE_ERR_* 错误码。
+        ret = ctypes.windll.shell32.ShellExecuteW(0, verb, str(path), params, None, 0)
+    except Exception as exc:
+        return False, "调用打印机失败：%s" % exc
+    if ret > 32:
+        note = ("；Windows 下 --copies 由打印程序决定，可能不生效"
+                if copies and int(copies) > 1 else "")
+        return True, "已交给系统按 %s 打印，请留意打印机输出%s" % (
+            printer if printer else "默认打印机", note)
+    if ret == 31:  # SE_ERR_NOASSOC：没有关联打印处理程序
+        return False, ("PDF 关联程序不支持静默打印。可打开文件手动打印；"
+                       "或安装 SumatraPDF 并设为默认 PDF 阅读器后重试")
+    return False, "调用打印机失败（ShellExecute 错误码 %d）" % ret
 
 
 def _write_report(report: MergeReport, opts: Options) -> Optional[Path]:
@@ -1532,7 +1593,7 @@ def run_cli(argv: Sequence[str]) -> int:
             found = list_printers()
             printer = next((n for n, d in found if d), found[0][0] if found else None)
         if not printer:
-            print("\n未检测到打印机，已跳过打印。可在「系统设置 → 打印机与扫描仪」添加后重试。",
+            print("\n未检测到打印机，已跳过打印。可在系统设置里添加打印机后重试。",
                   file=sys.stderr)
         else:
             ok, msg = print_pdf(report.output, printer, opts.print_copies)
@@ -2140,6 +2201,16 @@ def run_gui() -> int:
 # 入口
 # --------------------------------------------------------------------------
 
+def _setup_stdio() -> None:
+    """Windows 下管道输出默认走本地编码（中文系统是 GBK），统一成 UTF-8，
+    免得调用方（agent）按 UTF-8 读到乱码。macOS / Linux 上本来就已是 UTF-8，无感。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if not args:
@@ -2148,4 +2219,5 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 if __name__ == "__main__":
+    _setup_stdio()
     raise SystemExit(main())
