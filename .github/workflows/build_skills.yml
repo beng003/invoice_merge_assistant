@@ -1,0 +1,39 @@
+name: build-skills
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync core script into skill
+        run: |
+          cp invoice_merge.py skills/invoice-merge/scripts/invoice_merge.py
+          python -m py_compile skills/invoice-merge/scripts/invoice_merge.py
+          python skills/invoice-merge/scripts/run.py --help > /dev/null || true
+
+      - name: Package skill
+        run: |
+          cd skills
+          zip -r ../invoice_merge_skills.zip invoice-merge -x "*.DS_Store" "*__pycache__*"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: invoice_merge_skills
+          path: invoice_merge_skills.zip
+          retention-days: 30
+
+      - name: Publish to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: invoice_merge_skills.zip
