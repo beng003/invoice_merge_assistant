@@ -43,7 +43,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # --------------------------------------------------------------------------
 # 依赖
