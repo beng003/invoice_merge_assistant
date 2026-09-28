@@ -33,7 +33,7 @@ jobs:
 
       - name: Zip dist folder
         shell: pwsh
-        run: Compress-Archive -Path "dist/*" -DestinationPath "dist/InvoiceMerge_Windows.zip"
+        run: python -c "import shutil; shutil.make_archive('dist/InvoiceMerge_Windows', 'zip', 'dist', '发票合并小助手')"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
