@@ -8,6 +8,8 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      PYTHONUTF8: '1'
     steps:
       - uses: actions/checkout@v4
 
@@ -20,18 +22,22 @@ jobs:
           pip install pymupdf numpy pyinstaller PySide6-Essentials
 
       - name: Build exe
-        run: pyinstaller --noconfirm --clean "build_app/发票合并小助手-win.spec"
+        run: pyinstaller --noconfirm --clean "build_app/InvoiceMerge-win.spec"
 
       - name: Smoke test CLI
-        run: dist/发票合并小助手/发票合并小助手.exe --help
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem dist -Recurse -Filter *.exe | Select-Object -First 1
+          Write-Host "Found: $($exe.FullName)"
+          & $exe.FullName --help
 
       - name: Zip dist folder
         shell: pwsh
-        run: Compress-Archive -Path "dist/发票合并小助手/*" -DestinationPath "dist/发票合并小助手-Windows.zip"
+        run: Compress-Archive -Path "dist/*" -DestinationPath "dist/InvoiceMerge-Windows.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: InvoiceMerge-Windows
-          path: dist/发票合并小助手-Windows.zip
+          path: dist/InvoiceMerge-Windows.zip
           retention-days: 30
