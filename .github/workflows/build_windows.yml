@@ -33,11 +33,11 @@ jobs:
 
       - name: Zip dist folder
         shell: pwsh
-        run: Compress-Archive -Path "dist/*" -DestinationPath "dist/InvoiceMerge-Windows.zip"
+        run: Compress-Archive -Path "dist/*" -DestinationPath "dist/InvoiceMerge_Windows.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: InvoiceMerge-Windows
-          path: dist/InvoiceMerge-Windows.zip
+          name: InvoiceMerge_Windows
+          path: dist/InvoiceMerge_Windows.zip
           retention-days: 30
