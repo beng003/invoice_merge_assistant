@@ -27,7 +27,7 @@ jobs:
         run: "dist/发票合并小助手.app/Contents/MacOS/发票合并小助手 --help"
 
       - name: Zip app bundle
-        run: ditto -c -k --sequesterDir --keepParent "dist/发票合并小助手.app" "dist/InvoiceMerge_MacOS.zip"
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/发票合并小助手.app" "dist/InvoiceMerge_MacOS.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
