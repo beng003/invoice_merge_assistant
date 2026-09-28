@@ -25,7 +25,14 @@ from typing import List, Optional, Sequence, Tuple
 
 try:
     from PySide6.QtCore import QByteArray, QSize, Qt, QThread, Signal
-    from PySide6.QtGui import QIcon, QPainter, QPixmap
+    from PySide6.QtGui import (
+    QDragEnterEvent,
+    QDragMoveEvent,
+    QDropEvent,
+    QIcon,
+    QPainter,
+    QPixmap,
+)
     from PySide6.QtSvg import QSvgRenderer
     from PySide6.QtWidgets import (
         QAbstractItemView,
@@ -593,6 +600,11 @@ class MainWindow(QWidget):
         self.resize(1000, 860)
         self.setMinimumSize(820, 560)      # 有滚动区兜底，窗口小也不会裁字
 
+        # 整个窗口接收拖放：从访达把 PDF / 文件夹直接拖进来即可添加。
+        # 日志框、路径框、表格会默认自己吃掉拖放事件，下面建控件时逐个关掉，
+        # 让拖放事件冒泡到窗口统一处理。
+        self.setAcceptDrops(True)
+
         self.files: List[Path] = []
         self.infos: dict = {}
         self.last_report: Optional[core.MergeReport] = None
@@ -729,6 +741,10 @@ class MainWindow(QWidget):
         bar.addStretch(1)
         outer.addLayout(bar)
 
+        drag_hint = QLabel("提示：把 PDF 文件或文件夹直接拖进窗口即可添加，一次可拖多个")
+        drag_hint.setObjectName("hint")
+        outer.addWidget(drag_hint)
+
         self.table = QTableWidget(0, len(self.COLS))
         self.table.setHorizontalHeaderLabels([c[0] for c in self.COLS])
         self.table.verticalHeader().setVisible(False)
@@ -738,6 +754,7 @@ class MainWindow(QWidget):
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
         self.table.setMinimumHeight(190)
+        self.table.setAcceptDrops(False)   # 拖放统一交给主窗口处理
         header = self.table.horizontalHeader()
         header.setHighlightSections(False)
         for i, (_t, w) in enumerate(self.COLS):
@@ -826,6 +843,7 @@ class MainWindow(QWidget):
         out_row.addWidget(field_label("输出到"))
         self.path_edit = QLineEdit()
         self.path_edit.setPlaceholderText("留空则输出到第一个文件所在目录")
+        self.path_edit.setAcceptDrops(False)   # 拖放统一交给主窗口处理
         out_row.addWidget(self.path_edit, 1)
         out_row.addWidget(self._mkbtn("另存为", "folder-open", slot=self.pick_output))
         outer.addLayout(out_row)
@@ -867,6 +885,7 @@ class MainWindow(QWidget):
         frame, outer = make_card("日志")
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
+        self.log.setAcceptDrops(False)     # 拖放统一交给主窗口处理
         self.log.setMinimumHeight(104)
         self.log.setMaximumBlockCount(600)
         outer.addWidget(self.log)
@@ -899,6 +918,73 @@ class MainWindow(QWidget):
         self.last_dir = folder
         self.settings["last_dir"] = str(folder)
         core.save_settings(self.settings)
+
+    # ---------- 拖放添加 ----------
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        if not event.mimeData().hasUrls():
+            event.ignore()
+            return
+        paths = [Path(url.toLocalFile()) for url in event.mimeData().urls()
+                 if url.isLocalFile() and url.toLocalFile()]
+        event.acceptProposedAction()
+        if paths:
+            self.add_dropped(paths)
+
+    def add_dropped(self, paths: Sequence[Path]) -> None:
+        """把拖入的文件 / 文件夹**追加**到材料列表，不覆盖已有内容。
+
+        文件夹按「包含子文件夹」开关展开成 PDF；已在列表里的自动去重；
+        非 PDF 计数跳过，不打断整批添加。只分析新加的文件，旧文件的
+        分析结果沿用。
+        """
+        pdfs: List[Path] = []
+        skipped = 0
+        for p in paths:
+            if p.is_dir():
+                pdfs.extend(core.list_pdfs(p, self.chk_recursive.isChecked()))
+            elif p.suffix.lower() == ".pdf" and p.is_file():
+                pdfs.append(p)
+            else:
+                skipped += 1
+
+        existing = set(self.files)
+        fresh = [p for p in pdfs if p not in existing]
+        dup = len(pdfs) - len(fresh)
+
+        if not fresh:
+            self.status_label.setText(
+                "所选文件已在列表中" if pdfs else "拖入的内容里没有可用的 PDF")
+            return
+
+        self.files.extend(fresh)
+        self.last_report = None
+        self.btn_reveal.setEnabled(False)
+        self.btn_print.setEnabled(False)
+        self._remember_dir(paths[0])
+        self._sync_output_path(None)
+        self._refresh_table()
+        self.start_analysis(fresh)
+
+        msg = "已添加 %d 个文件" % len(fresh)
+        if dup:
+            msg += "（%d 个已在列表中）" % dup
+        if skipped:
+            msg += "，跳过 %d 个非 PDF" % skipped
+        self.status_label.setText(msg)
+        self.log.appendPlainText("拖入添加 → " + msg)
 
     # ---------- 文件列表 ----------
 
@@ -1047,7 +1133,7 @@ class MainWindow(QWidget):
 
     # ---------- 分析 ----------
 
-    def start_analysis(self) -> None:
+    def start_analysis(self, targets: Optional[Sequence[Path]] = None) -> None:
         if not self.files:
             return
         old = self.analyzer
@@ -1055,7 +1141,10 @@ class MainWindow(QWidget):
             old.requestInterruption()
             old.wait(2000)
 
-        self.analyzer = AnalyzeWorker(self.files, self._options(), self)
+        # 不传 targets 就分析全部；拖放追加时只分析新文件，旧结果沿用
+        if targets is None:
+            targets = self.files
+        self.analyzer = AnalyzeWorker(list(targets), self._options(), self)
         self.analyzer.one_done.connect(self._on_analyzed)
         self.analyzer.all_done.connect(self._after_analysis)
         self.analyzer.start()

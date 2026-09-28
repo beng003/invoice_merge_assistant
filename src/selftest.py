@@ -842,6 +842,73 @@ def main() -> int:
                 check("L7 打印对话框可构建并读到打印机列表", False,
                       "%s: %s" % (exc.__class__.__name__, exc))
 
+            # ---------- 拖放添加：模拟一次「文件 + 文件夹 + 非 PDF + 重复项」 ----------
+            try:
+                from PySide6.QtCore import QMimeData, QPointF, Qt, QUrl
+                from PySide6.QtGui import QDropEvent
+            except Exception as exc:
+                print("   [跳过] PySide6 事件类不可用：%s" % exc)
+            else:
+                import time as _time
+                drop_dir = workdir / "拖放样本"
+                drop_dir.mkdir(exist_ok=True)
+                for nm in ("拖放甲.pdf", "拖放乙.pdf"):
+                    _dd = fitz.open()
+                    _dd.new_page(width=A4_W, height=A4_H)
+                    _dd.save(str(drop_dir / nm))
+                    _dd.close()
+                (drop_dir / "说明.txt").write_text("非 PDF", encoding="utf-8")
+
+                # QDropEvent 只保存 QMimeData 的裸指针，Python 侧必须自己保住
+                # 引用，否则临时对象被回收后事件里访问的是悬垂指针（段错误）。
+                mimes: List[object] = []
+
+                def _drop_event() -> "QDropEvent":
+                    mime = QMimeData()
+                    mime.setUrls([
+                        QUrl.fromLocalFile(str(drop_dir / "拖放甲.pdf")),
+                        QUrl.fromLocalFile(str(drop_dir)),
+                        QUrl.fromLocalFile(str(drop_dir / "说明.txt")),
+                        QUrl.fromLocalFile(str(drop_dir / "拖放甲.pdf")),   # 重复项
+                    ])
+                    mimes.append(mime)
+                    return QDropEvent(QPointF(10, 10), Qt.CopyAction, mime,
+                                      Qt.LeftButton, Qt.NoModifier)
+
+                win.files, win.infos = [], {}
+                win.dropEvent(_drop_event())
+                check("L8 拖入一次可添加多个 PDF（文件 + 文件夹），去重并跳过非 PDF",
+                      {p.name for p in win.files} == {"拖放甲.pdf", "拖放乙.pdf"},
+                      str([p.name for p in win.files]))
+
+                n_before = len(win.files)
+                win.dropEvent(_drop_event())
+                check("L9 重复拖入自动去重，不产生重复项",
+                      len(win.files) == n_before,
+                      str([p.name for p in win.files]))
+
+                # 拖入后自动开始分析，等后台线程跑完确认结果齐全
+                if win.analyzer is not None:
+                    win.analyzer.wait(15000)
+                    _qapp = gui_qt.QApplication.instance()
+                    for _ in range(100):
+                        _qapp.processEvents()
+                        if win.infos and all(f in win.infos for f in win.files):
+                            break
+                        _time.sleep(0.05)
+                    check("L10 拖入的文件自动开始分析",
+                          bool(win.infos) and all(
+                              win.infos.get(f) is not None and win.infos[f].ok
+                              for f in win.files),
+                          str([p.name for p in win.files]))
+                    check("L11 窗口已开启拖放接收",
+                          win.acceptDrops() and not win.table.acceptDrops()
+                          and not win.log.acceptDrops()
+                          and not win.path_edit.acceptDrops(),
+                          "window=%s table=%s log=%s path=%s" % (
+                              win.acceptDrops(), win.table.acceptDrops(),
+                              win.log.acceptDrops(), win.path_edit.acceptDrops()))
+
             win.close()
 
     # ================= 用例 M：界面不会被压到裁字 =================

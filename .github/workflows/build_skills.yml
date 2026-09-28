@@ -16,7 +16,7 @@ jobs:
 
       - name: Sync core script into skill
         run: |
-          cp invoice_merge.py skills/invoice-merge/scripts/invoice_merge.py
+          cp src/invoice_merge.py skills/invoice-merge/scripts/invoice_merge.py
           python -m py_compile skills/invoice-merge/scripts/invoice_merge.py
           python skills/invoice-merge/scripts/run.py --help > /dev/null || true
 

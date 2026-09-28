@@ -3,7 +3,7 @@
 
 cd "$(dirname "$0")" || exit 1
 
-SELF="$PWD/invoice_merge.py"
+SELF="$PWD/src/invoice_merge.py"
 if [ ! -f "$SELF" ]; then
     echo "找不到 invoice_merge.py，请确认本文件与主程序在同一目录。"
     read -r -p "按回车键退出…"

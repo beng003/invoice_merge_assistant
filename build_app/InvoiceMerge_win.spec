@@ -5,13 +5,14 @@
 import os
 
 ROOT = os.path.abspath(os.path.join(SPECPATH, '..'))
+SRC = os.path.join(ROOT, 'src')
 
 a = Analysis(
-    [os.path.join(ROOT, 'invoice_merge.py')],
-    pathex=[],
+    [os.path.join(SRC, 'invoice_merge.py')],
+    pathex=[SRC],
     binaries=[],
     datas=[
-        (os.path.join(ROOT, 'assets'), 'assets'),
+        (os.path.join(SRC, 'assets'), 'assets'),
     ],
     hiddenimports=['tkinter', 'gui_qt'],
     hookspath=[],

@@ -1,12 +1,17 @@
 # -*- mode: python ; coding: utf-8 -*-
+# 本地打包用 spec（与 CI 用的 InvoiceMerge_mac.spec 同构，路径相对仓库根）
 
+import os
+
+ROOT = os.path.abspath(os.path.join(SPECPATH, '..'))
+SRC = os.path.join(ROOT, 'src')
 
 a = Analysis(
-    ['/Users/beng003/Documents/正式工作/工具/发票合并小助手/invoice_merge.py'],
-    pathex=[],
+    [os.path.join(SRC, 'invoice_merge.py')],
+    pathex=[SRC],
     binaries=[],
     datas=[
-        ('/Users/beng003/Documents/正式工作/工具/发票合并小助手/assets', 'assets'),
+        (os.path.join(SRC, 'assets'), 'assets'),
     ],
     hiddenimports=['tkinter', 'gui_qt'],
     hookspath=[],
@@ -34,7 +39,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['/Users/beng003/Documents/正式工作/工具/发票合并小助手/build_app/AppIcon.icns'],
+    icon=os.path.join(ROOT, 'build_app', 'AppIcon.icns'),
 )
 coll = COLLECT(
     exe,
@@ -48,6 +53,6 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='发票合并小助手.app',
-    icon='/Users/beng003/Documents/正式工作/工具/发票合并小助手/build_app/AppIcon.icns',
+    icon=os.path.join(ROOT, 'build_app', 'AppIcon.icns'),
     bundle_identifier='local.tools.invoice-merge',
 )

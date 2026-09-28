@@ -27,7 +27,7 @@
   或项目的 `.workbuddy/skills/`（项目级）之后，对话里直接说"合并这批发票"，
   AI 会按包内 `SKILL.md` 的流程调命令行完成合并。装新机器只需验证
   `python run.py --help` 能跑、解释器装了 `pymupdf` 即可。
-- 三种包都出自同一份 `invoice_merge.py`，合并逻辑完全一致，差别只在运行形态
+- 三种包都出自同一份 `src/invoice_merge.py`，合并逻辑完全一致，差别只在运行形态
   （图形程序 vs 命令行技能）与目标平台。
 
 ---
@@ -65,13 +65,13 @@ chmod +x "启动.command"
 cd "/Users/beng003/Documents/正式工作/工具/发票合并小助手"
 
 # 打开图形界面
-/Users/beng003/.workbuddy/binaries/python/envs/invoice-tool/bin/python invoice_merge.py
+/Users/beng003/.workbuddy/binaries/python/envs/invoice-tool/bin/python src/invoice_merge.py
 
 # 命令行直接合并
-/Users/beng003/.workbuddy/binaries/python/envs/invoice-tool/bin/python invoice_merge.py --folder ~/Desktop/发票
+/Users/beng003/.workbuddy/binaries/python/envs/invoice-tool/bin/python src/invoice_merge.py --folder ~/Desktop/发票
 
 # 报销材料常见组合：按拼音排序 + 横向内容旋转填满 A4 纵向
-/Users/beng003/.workbuddy/binaries/python/envs/invoice-tool/bin/python invoice_merge.py \
+/Users/beng003/.workbuddy/binaries/python/envs/invoice-tool/bin/python src/invoice_merge.py \
     --folder ~/Desktop/发票 --size a4-rotate --sort pinyin
 ```
 
@@ -146,6 +146,8 @@ python3 -m venv .venv
 └────────────────────────────────────────────────────────────────┘
 ```
 
+支持**拖放添加**：把 PDF 文件或文件夹从访达直接拖进窗口即可加入列表，一次可拖多个；自动展开文件夹、去重、跳过非 PDF，**追加**到已有列表而不覆盖。
+
 界面设计约定（改动界面时请沿用）：
 
 | 项目 | 约定 |
@@ -156,7 +158,7 @@ python3 -m venv .venv
 | 字号 | 标题 21 bold、卡片标题 14、正文 13 |
 | 圆角 | 卡片 12px、按钮与输入框 8px |
 | 间距 | 卡片之间 14px、控件之间 12~20px、卡片内边距 18px |
-| 图标 | Lucide SVG（`assets/icons/`），运行时按主题色着色 |
+| 图标 | Lucide SVG（`src/assets/icons/`），运行时按主题色着色 |
 | 主题 | 深色 / 浅色两套，右上角按钮切换，选择会记住；两套都用灰阶 + 一个主色 + 一个强调色 |
 
 深色与浅色的对应关系：
@@ -190,14 +192,14 @@ python3 -m venv .venv
 ### 命令行
 
 ```
-用法：invoice_merge.py [--files PDF … | --folder DIR] [选项]
+用法：src/invoice_merge.py [--files PDF … | --folder DIR] [选项]
 
 示例：
-  python invoice_merge.py                                   # 打开图形界面
-  python invoice_merge.py --folder ~/Desktop/发票
-  python invoice_merge.py --files a.pdf b.pdf -o 合并.pdf
-  python invoice_merge.py --folder ./发票 --size keep --sort mtime
-  python invoice_merge.py --folder ./发票 --dry-run          # 只诊断不生成
+  python src/invoice_merge.py                                   # 打开图形界面
+  python src/invoice_merge.py --folder ~/Desktop/发票
+  python src/invoice_merge.py --files a.pdf b.pdf -o 合并.pdf
+  python src/invoice_merge.py --folder ./发票 --size keep --sort mtime
+  python src/invoice_merge.py --folder ./发票 --dry-run          # 只诊断不生成
 ```
 
 不带任何参数运行即打开图形界面。
@@ -360,7 +362,7 @@ PDF 的 `CropBox` 定义了"显示窗口"。有些扫描件或 PDF 处理工具�
 ### 打印没反应怎么排查
 
 1. 确认系统认得打印机：苹果菜单 →「系统设置 → 打印机与扫描仪」，
-   或命令行执行 `python invoice_merge.py --list-printers`。
+   或命令行执行 `python src/invoice_merge.py --list-printers`。
 2. 确认选对了打印机：工具里的「打印…」对话框会列出系统所有打印机，带「（默认）」的是默认机。
 3. 看队列里有没有卡住的任务：终端执行 `lpstat -o`；要清空用 `cancel -a`。
 4. 如果提示"已提交打印任务"却不出纸，通常是打印机本身的问题（关机、离线、缺纸、需要人工干预），
@@ -374,13 +376,13 @@ PDF 的 `CropBox` 定义了"显示窗口"。有些扫描件或 PDF 处理工具�
 
 ```bash
 cd "/Users/beng003/Documents/正式工作/工具/发票合并小助手"
-/Users/beng003/.workbuddy/binaries/python/envs/invoice-tool/bin/python selftest.py
+/Users/beng003/.workbuddy/binaries/python/envs/invoice-tool/bin/python src/selftest.py
 
 # 保留样本与输出，便于人工翻看
-/Users/beng003/.workbuddy/binaries/python/envs/invoice-tool/bin/python selftest.py --keep-dir
+/Users/beng003/.workbuddy/binaries/python/envs/invoice-tool/bin/python src/selftest.py --keep-dir
 ```
 
-当前结果：**85 项检查全部通过**。
+当前结果：**110 项检查全部通过**。
 
 ---
 
@@ -389,17 +391,17 @@ cd "/Users/beng003/Documents/正式工作/工具/发票合并小助手"
 | 文件 | 说明 |
 | --- | --- |
 | `发票合并小助手.app` | macOS 独立应用（本机构建），双击即用，约 145 MB，可单独拷走 |
-| `invoice_merge.py` | 核心逻辑（PDF 处理、合并、分类、打印）+ 命令行 + 内置 Tkinter 界面 |
-| `gui_qt.py` | 图形界面（PySide6），含主题、图标、后台线程与打印对话框 |
-| `assets/icons/` | Lucide 图标（SVG），运行时按主题色着色 |
+| `src/invoice_merge.py` | 核心逻辑（PDF 处理、合并、分类、打印）+ 命令行 + 内置 Tkinter 界面 |
+| `src/gui_qt.py` | 图形界面（PySide6），含主题、图标、后台线程与打印对话框 |
+| `src/assets/icons/` | Lucide 图标（SVG），运行时按主题色着色 |
 | `启动.command` | 双击用本机 Python 环境启动图形界面 |
-| `selftest.py` | 自检脚本，构造样本并校验合并结果，含界面冒烟 |
+| `src/selftest.py` | 自检脚本，构造样本并校验合并结果，含界面冒烟 |
 | `skills/invoice-merge/` | AI 技能包源文件（`SKILL.md`、`run.py`、`references/`）；CI 构建时自动同步核心脚本后打成 zip |
 | `build_app/` | 打包素材：图标（`AppIcon.icns` / `AppIcon.ico`）与 spec —— 本机 mac 打包用 `发票合并小助手.spec`，CI 用 `InvoiceMerge_mac.spec` / `InvoiceMerge_win.spec` |
 | `.github/workflows/` | 三个云构建工作流：`build_windows.yml` / `build_mac.yml` / `build_skills.yml`，打 `v*` tag 自动发布 Release |
 | `README.md` | 本文件 |
 
-界面用 PySide6 实现，核心逻辑留在 `invoice_merge.py` 里 —— 两边靠 `Options` / `MergeReport`
+界面用 PySide6 实现，核心逻辑留在 `src/invoice_merge.py` 里 —— 两边靠 `Options` / `MergeReport`
 这些纯数据结构通信，换界面不影响合并本身。没装 PySide6 时 `run_gui()` 会自动退回
 内置的 Tkinter 界面，功能不缺失。
 
@@ -436,7 +438,7 @@ cd "/Users/beng003/Documents/正式工作/工具/发票合并小助手"
 - app 是 ad-hoc 签名的，内部依赖用相对链接，**整体拷贝到别的机器照样能跑**（已验证）。
 - **装了 PySide6 才会打进去**：`pip install -i https://pypi.tuna.tsinghua.edu.cn/simple PySide6-Essentials`
   （直连 PyPI 会非常慢，实测 110MB 的包走镜像 20 秒、直连 20 分钟还没完）。
-- 图标通过 `spec` 的 `datas` 打进去（`assets/` → `Contents/Resources/assets/`）。
+- 图标通过 `spec` 的 `datas` 打进去（`src/assets/` → `Contents/Resources/assets/`）。
   换了图标或加了新图标，要重新打包才生效。
 - 加了 PySide6 后体积从 86 MB 涨到约 145 MB，多出来的基本都是 Qt 的库和插件。
 
@@ -448,7 +450,7 @@ PyInstaller 不支持跨平台编译，除上面本机打包 macOS app 外，其
 | --- | --- | --- |
 | `build_windows.yml` | windows-latest | `InvoiceMerge_Windows.zip`（exe 绿色版） |
 | `build_mac.yml` | macos-latest（Apple 芯片） | `InvoiceMerge_MacOS.zip`（.app） |
-| `build_skills.yml` | ubuntu-latest | `invoice_merge_skills.zip`（技能包，构建时自动同步根目录核心脚本） |
+| `build_skills.yml` | ubuntu-latest | `invoice_merge_skills.zip`（技能包，构建时自动同步 `src/` 核心脚本） |
 
 - **发版**：`git tag vX.Y.Z && git push origin vX.Y.Z`，三个工作流同时构建，
   产物自动传到该 tag 的 Release，约 5 分钟后三件套上线。
