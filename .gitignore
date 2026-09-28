@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller 打包产物
+发票合并小助手.app/
+build_app/AppIcon.iconset/
+build/
+dist/
+
+# 系统文件
+.DS_Store
