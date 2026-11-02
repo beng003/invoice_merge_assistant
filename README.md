@@ -86,7 +86,9 @@ cd "/Users/beng003/Documents/正式工作/工具/发票合并小助手"
 | 项目 | 要求 |
 | --- | --- |
 | Python | 3.9 以上 |
-| 必需库 | `pymupdf`（核心依赖，读写 PDF） |
+| 必需库 | `pymupdf<2`（核心依赖，读写 PDF）。**必须锁 1.x**：2.0 起 PyMuPDF 捆绑了 onnx
+布局模型，PyInstaller 不会打包那批 yaml/onnx 资源，打出来的 app 一启动就报
+`FileNotFoundError: .../pymupdf/layout/resources/onnx/...` |
 | 图形界面 | `PySide6`（推荐）；未装时自动回退到内置的 `tkinter` 界面 |
 | 可选库 | `numpy`（加速内容检测，缺失时自动降级） |
 | 可选库 | `Pillow` + `pillow-heif`（Windows / Linux 上解 HEIC / WebP 图片；缺失时若系统有 ImageMagick / ffmpeg 也能兜住，都没有就跳过该图片并提示转格式） |
@@ -108,7 +110,7 @@ cd "/Users/beng003/Documents/正式工作/工具/发票合并小助手"
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install pymupdf numpy
+.venv/bin/pip install 'pymupdf<2' numpy
 # Windows / Linux 上要处理 HEIC（iPhone 照片）还需装这两个
 .venv/bin/pip install Pillow pillow-heif
 # PySide6 包体较大，国内建议走镜像
@@ -401,7 +403,7 @@ cd "/Users/beng003/Documents/正式工作/工具/发票合并小助手"
 /Users/beng003/.workbuddy/binaries/python/envs/invoice-tool/bin/python src/selftest.py --keep-dir
 ```
 
-当前结果：**147 项检查全部通过**（含 37 项图片材料用例；少数用例依赖可选工具，
+当前结果：**148 项检查全部通过**（含 38 项图片材料用例；少数用例依赖可选工具，
 缺 `sips` / `cwebp` 时会自动跳过并在输出里注明，通过数随之减少）。
 
 ---

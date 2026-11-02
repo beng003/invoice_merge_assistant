@@ -1644,6 +1644,21 @@ def main() -> int:
             probe_webp.unlink(missing_ok=True)
         probe.unlink(missing_ok=True)
 
+        # ---- PyMuPDF 版本守卫：2.x 打的包会崩，得在源码层面就拦住 ----
+        import subprocess as _sp
+        guard = _sp.run(
+            [sys.executable, "-c",
+             "import sys,types,runpy;"
+             "f=types.ModuleType('pymupdf');f.version=('2.0.0','2.0.0',None);"
+             "sys.modules['pymupdf']=f;sys.argv=['x','--version'];"
+             "runpy.run_path(%r, run_name='__main__')" % str(Path(__file__).with_name("invoice_merge.py")),
+             ],
+            capture_output=True, text=True, timeout=60)
+        check("IM37 PyMuPDF 2.x 被明确拦下并提示改回 1.x（避免打包版启动即崩）",
+              guard.returncode == 2 and "pymupdf<2" in (guard.stderr or ""),
+              "退出码=%s 提示=%s" % (guard.returncode,
+                                   (guard.stderr or "").strip().splitlines()[:1]))
+
         # ---- 超 A4 的图片：keep 模式下不能产出「1.4 米宽的纸」 ----
         huge_dir = workdir / "超大图片"
         huge = huge_dir / "手机原图.png"

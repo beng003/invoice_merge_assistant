@@ -22,7 +22,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pymupdf numpy pyinstaller PySide6-Essentials pillow pillow-heif
+          pip install 'pymupdf<2' numpy pyinstaller PySide6-Essentials pillow pillow-heif
 
       - name: Build exe
         run: pyinstaller --noconfirm --clean "build_app/InvoiceMerge_win.spec"

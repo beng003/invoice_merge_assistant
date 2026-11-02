@@ -67,6 +67,21 @@ except ImportError:  # 兼容旧版本的导入名
         )
         raise SystemExit(2)
 
+# PyMuPDF 2.0 起捆绑了 onnx 布局模型，PyInstaller 不会打包那批资源，
+# 打出来的 app 会一启动就 FileNotFoundError。1.x 才是本工具验证过的版本。
+_PYMUPDF_MAJOR = 1
+try:
+    _pu_ver = getattr(fitz, "version", None)
+    _pu_major = int(str(_pu_ver[0]).split(".")[0]) if _pu_ver else 0
+except Exception:  # pragma: no cover - 版本号读不出来就别拦
+    _pu_major = 0
+if _pu_major and _pu_major > _PYMUPDF_MAJOR:
+    sys.stderr.write(
+        "PyMuPDF 版本过新（%s）：本工具按 1.x 验证，2.x 的 onnx 布局模型会让打包版启动失败。\n"
+        "请改用 1.x：\n    python -m pip install 'pymupdf<2'\n" % (_pu_ver[0],)
+    )
+    raise SystemExit(2)
+
 try:
     import numpy as _np
 except Exception:  # pragma: no cover - numpy 只是加速项
