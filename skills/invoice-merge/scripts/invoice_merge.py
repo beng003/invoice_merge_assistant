@@ -49,7 +49,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 # --------------------------------------------------------------------------
 # 依赖
@@ -178,6 +178,14 @@ SETTLEMENT_HINTS = ("结账单", "结帐单", "消费明细", "账单明细", "�
 # 出差申请审批单是流程单据，都不是票据本身。必须早于火车 / 飞机关键词判定，
 # 否则"登机"会被交通关键词抢走。
 OTHER_DOC_HINTS = ("登机凭证", "登机牌", "boarding pass", "出差申请", "出差审批")
+
+# 航旅纵横等平台出的「行程校验单」只是验真用的行程信息单（票价、航段、票号），
+# 不是税务发票 —— 归「其他材料」。真正的机票发票长这样：
+# 「电子发票（航空运输电子客票行程单）」，带"行程单"三个字但不带"校验单"。
+# 它往往和校验单同一次行程各占一份，早先因为都含"机票"被并成一类，
+# 结果去程发票配了回程校验单。同样排除带"发票"字样的文件，
+# 避免把「发票+校验单」合并在一起的 PDF 误判成非发票。
+VERIFY_HINTS = ("行程校验", "校验单")
 
 # 拼版（band 排版）策略：把小材料各占纸张的一条横向区域，多张合排到一张纸上。
 # 取值 = (最少条带, 最多条带, 允许旋转)。
@@ -459,11 +467,17 @@ def classify_document(name: str, text: str = "") -> Tuple[str, str]:
     2. **电子登机凭证、出差申请审批单也只是 A4 单据**，同样归「其他材料」，
        以便和结账单一起三张一转拼到一页。这条必须走在交通关键词前面，
        否则"登机"会被火车 / 飞机那组抢走。
+    3. **行程校验单不是机票**，是平台给的验真行程信息单，同样归「其他材料」。
+       机票发票是「电子发票（航空运输电子客票行程单）」。这条也必须走在前头：
+       文件名里通常带着"机票"两个字，否则会被交通关键词抢走。
     """
     haystack = ("%s\n%s" % (name, text)).lower()
 
     if any(hint in haystack for hint in SETTLEMENT_HINTS) and "发票" not in haystack:
         return CATEGORY_OTHER, "结账单（非发票）"
+
+    if any(hint in haystack for hint in VERIFY_HINTS) and "发票" not in haystack:
+        return CATEGORY_OTHER, "行程校验单（非发票）"
 
     for hint in OTHER_DOC_HINTS:
         if hint in haystack:

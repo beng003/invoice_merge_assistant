@@ -1715,7 +1715,7 @@ def main() -> int:
         """正文只占上半页，页脚一行小字贴在最底 —— 早先这行把内容框撑满整页。"""
         doc = fitz.open()
         pg = doc.new_page(width=A4_W, height=A4_H)
-        pg.insert_text((60, 90), "航旅纵横 - 行程校验单", fontsize=15, fontname="china-s")
+        pg.insert_text((60, 90), "电子发票（航空运输电子客票行程单）", fontsize=15, fontname="china-s")
         pg.insert_text((60, 130), "票价 2410.00  航段 济南 - 乌鲁木齐", fontsize=11, fontname="china-s")
         pg.insert_text((60, 165), "备注：本单由航旅纵横出具，可扫码验真", fontsize=11, fontname="china-s")
         pg.insert_text((A4_W / 2 - 34, A4_H - 16), "第 1 页/共 1 页", fontsize=8, fontname="china-s")
@@ -1746,8 +1746,8 @@ def main() -> int:
           % (len(inks_q2),
              "%.0f" % inks_q2[1].y1 if len(inks_q2) > 1 and inks_q2[1] else "-", A4_H))
 
-    make_q_footer("行程校验单_带页脚.pdf")
-    doc_q3 = im._open_source(qdir / "行程校验单_带页脚.pdf")
+    make_q_footer("机票发票_带页脚.pdf")
+    doc_q3 = im._open_source(qdir / "机票发票_带页脚.pdf")
     raw_q3 = im._ink_box(doc_q3[0], 72)
     main_q3 = im._main_ink_box(doc_q3[0], 72)
     doc_q3.close()
@@ -1758,9 +1758,9 @@ def main() -> int:
           "原框高 %.0f → 新框高 %.0f"
           % (raw_q3.height if raw_q3 else -1, main_q3.height if main_q3 else -1))
 
-    make_q_footer("行程校验单_带页脚2.pdf")
+    make_q_footer("机票发票_带页脚2.pdf")
     rep_q = im.merge_pdfs(
-        [qdir / "行程校验单_带页脚.pdf", qdir / "行程校验单_带页脚2.pdf"],
+        [qdir / "机票发票_带页脚.pdf", qdir / "机票发票_带页脚2.pdf"],
         im.Options(scan_output=False, output=qdir / "Q_页脚拼版.pdf"),
         log=lambda _m: None)
     shrunk = [w for _s, w in rep_q.warnings if "内容放不下" in w]
@@ -1775,6 +1775,66 @@ def main() -> int:
           rep_q.ok and not shrunk and ink_w >= band_w * 0.85,
           "缩放告警=%s 内容宽 %.0fpt / 带子宽 %.0fpt"
           % (shrunk or "无", ink_w, band_w))
+
+    def make_q_verify(name: str) -> None:
+        """平台出的行程校验单：正文有"校验单"、没有"发票"，文件名里还带着"机票"。"""
+        doc = fitz.open()
+        pg = doc.new_page(width=A4_W, height=A4_H)
+        pg.insert_text((60, 90), "航旅纵横 - 行程校验单", fontsize=15, fontname="china-s")
+        pg.insert_text((60, 130), "姓名：王新龙    类别：机票    总金额 2410.0",
+                       fontsize=11, fontname="china-s")
+        pg.insert_text((60, 165), "2026-10-12  SC8715  济南遥墙 / 乌鲁木齐天山",
+                       fontsize=11, fontname="china-s")
+        doc.save(str(qdir / name))
+        doc.close()
+
+    def make_q_eticket(name: str) -> None:
+        """真正的机票发票：电子发票（航空运输电子客票行程单）。"""
+        doc = fitz.open()
+        pg = doc.new_page(width=A4_W, height=A4_H)
+        pg.insert_text((60, 90), "电子发票（航空运输电子客票行程单）",
+                       fontsize=15, fontname="china-s")
+        pg.insert_text((60, 130), "发票号码：26378324211083729554",
+                       fontsize=11, fontname="china-s")
+        pg.insert_text((60, 165), "票价 1807.34  合计 2110.00  航班 SC8716",
+                       fontsize=11, fontname="china-s")
+        doc.save(str(qdir / name))
+        doc.close()
+
+    make_q_verify("05_机票行程校验单_20261012_济南至乌鲁木齐_SC8715.pdf")
+    ver_q = im.analyze_source(
+        qdir / "05_机票行程校验单_20261012_济南至乌鲁木齐_SC8715.pdf", im.Options())
+    check("Q5 机票行程校验单不是机票，归其他材料（文件名里的\"机票\"不作数）",
+          ver_q.ok and ver_q.category == im.CATEGORY_OTHER,
+          "类别=%s 命中=%s" % (ver_q.category, ver_q.category_hit))
+
+    make_q_eticket("04_机票行程单电子发票_20261012_济南至乌鲁木齐_SC8715.pdf")
+    tic_q = im.analyze_source(
+        qdir / "04_机票行程单电子发票_20261012_济南至乌鲁木齐_SC8715.pdf", im.Options())
+    check("Q6 电子发票（航空运输电子客票行程单）仍算机票 / 火车票据",
+          tic_q.ok and tic_q.category == im.CATEGORY_TRAVEL,
+          "类别=%s 命中=%s" % (tic_q.category, tic_q.category_hit))
+
+    # 发票与校验单合订成一份时，主体是发票 → 仍按票据算，别被"校验单"抢走
+    doc_q7 = fitz.open()
+    for i in (0, 1):
+        pg = doc_q7.new_page(width=A4_W, height=A4_H)
+        if i == 0:
+            pg.insert_text((60, 90), "电子发票（航空运输电子客票行程单）",
+                           fontsize=15, fontname="china-s")
+            pg.insert_text((60, 130), "发票号码：26378324211083729554",
+                           fontsize=11, fontname="china-s")
+        else:
+            pg.insert_text((60, 90), "航旅纵横 - 行程校验单",
+                           fontsize=15, fontname="china-s")
+            pg.insert_text((60, 130), "机票 总金额 2410.0",
+                           fontsize=11, fontname="china-s")
+    doc_q7.save(str(qdir / "04_机票发票与校验单合订.pdf"))
+    doc_q7.close()
+    mix_q = im.analyze_source(qdir / "04_机票发票与校验单合订.pdf", im.Options())
+    check("Q7 发票与校验单合订的文件仍算票据（带\"发票\"字样时不信\"校验单\"）",
+          mix_q.ok and mix_q.category == im.CATEGORY_TRAVEL,
+          "类别=%s 命中=%s" % (mix_q.category, mix_q.category_hit))
 
     # ================= 结果 =================
     print()
