@@ -49,7 +49,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.2.2"
+__version__ = "1.2.3"
 
 # --------------------------------------------------------------------------
 # 依赖
@@ -490,14 +490,55 @@ def classify_document(name: str, text: str = "") -> Tuple[str, str]:
     return CATEGORY_OTHER, ""
 
 
+# 「其他材料」里东西很杂，但性质并不一样：水单、校验单、审批单、订单截图各是一摞。
+# 若按用户选的文件顺序直接排，同一摞会被别的材料隔开（05 校验单、06 截图、15 校验单…），
+# 贴票时得来回翻。这里再切一层小类，让同类的挨在一起。
+# 顺序有意义：先长串的、更具识别度的关键词放前面，免得"住宿账单"被"订单"之类抢走。
+OTHER_SUBTYPE_HINTS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("消费明细", ("水单", "结账单", "结帐单", "消费明细", "账单", "明细")),
+    ("行程校验单", ("校验单", "行程校验")),
+    ("出差审批单", ("出差审批", "出差申请", "审批单")),
+    ("登机凭证", ("登机凭证", "登机牌", "boarding")),
+    ("订单截图", ("订单", "截图", "待支付", "购票")),
+)
+
+
+def other_subtype(si: "SourceInfo") -> str:
+    """把「其他材料」再分小类，用于排序时把同类拢在一起。
+
+    先看文件名（截图、水单这类图片没有文本层，只能靠文件名），再看分类时命中的关键词，
+    都没有就落到小类叫「其他材料」，也就是彼此还能挨着。
+    """
+    if si.category != CATEGORY_OTHER:
+        return ""
+    hay = ("%s\n%s" % (si.path.name, si.category_hit or "")).lower()
+    for label, hints in OTHER_SUBTYPE_HINTS:
+        if any(h in hay for h in hints):
+            return label
+    return "其他材料"
+
+
 def organize_sources(sources: Sequence["SourceInfo"]) -> List["SourceInfo"]:
     """按报销业务顺序排列材料：酒店发票 → 差旅费报销单 → 火车/飞机 → 其他 → 封面。
 
-    组内保持调用方传入的先后（即用户选择的排序方式），不做二次排序。
+    组内保持调用方传入的先后（即用户选择的排序方式），不做二次排序；
+    唯一的例外是「其他材料」：它内部按小类（水单 / 校验单 / 审批单 / 截图 / 登机牌…）
+    再归拢一次，同类的挨在一起，小类之间按首次出现的先后排。
     """
     ordered: List["SourceInfo"] = []
     for category in CATEGORY_ORDER:
-        ordered.extend(si for si in sources if si.category == category)
+        group = [si for si in sources if si.category == category]
+        if category == CATEGORY_OTHER:
+            buckets: Dict[str, List["SourceInfo"]] = {}
+            order_seen: List[str] = []
+            for si in group:
+                key = other_subtype(si)
+                if key not in buckets:
+                    buckets[key] = []
+                    order_seen.append(key)
+                buckets[key].append(si)
+            group = [si for key in order_seen for si in buckets[key]]
+        ordered.extend(group)
     # 兜底：万一有类别不在预设顺序里，也不能丢材料
     seen = {id(si) for si in ordered}
     ordered.extend(si for si in sources if id(si) not in seen)
@@ -1306,15 +1347,26 @@ def build_units(plan: Sequence[Tuple["SourceInfo", PageInfo]],
     buf: List[Tuple["SourceInfo", PageInfo]] = []
     buf_cat: Optional[str] = None
     buf_pol: Optional[Tuple[int, int, bool]] = None
+    buf_sub: Optional[str] = None
 
     def flush() -> None:
-        nonlocal buf, buf_cat, buf_pol
+        nonlocal buf, buf_cat, buf_pol, buf_sub
         if buf:
             lo, _hi, rot = buf_pol
             units.append((buf, max(lo, len(buf)), rot))
-            buf, buf_cat, buf_pol = [], None, None
+            buf, buf_cat, buf_pol, buf_sub = [], None, None, None
 
-    for item in plan:
+    def same_subtype_run(start: int, sub: str) -> int:
+        """从 start 起、同属一个小类（其他材料）的页数，用来判断换页会不会把一摞拆开。"""
+        count = 0
+        for j in range(start, len(plan)):
+            sj = plan[j][0]
+            if sj.category != CATEGORY_OTHER or other_subtype(sj) != sub:
+                break
+            count += 1
+        return count
+
+    for idx, item in enumerate(plan):
         si = item[0]
         pol = band_policy(si.category) if band_applies(si.category, opts) else None
         if pol is None:
@@ -1323,8 +1375,16 @@ def build_units(plan: Sequence[Tuple["SourceInfo", PageInfo]],
             continue
         if buf_cat != si.category or len(buf) >= pol[1]:
             flush()
+        else:
+            sub = other_subtype(si) if si.category == CATEGORY_OTHER else None
+            # 换小类时，如果这一摞摆在剩下的条带里放不下，就整摞挪到下一页；
+            # 放得下就顺着排，不为凑整多费一张纸。
+            if (sub is not None and buf_sub is not None and sub != buf_sub
+                    and len(buf) + same_subtype_run(idx, sub) > pol[1]):
+                flush()
         buf.append(item)
         buf_cat, buf_pol = si.category, pol
+        buf_sub = other_subtype(si) if si.category == CATEGORY_OTHER else None
     flush()
     return units
 

@@ -1836,6 +1836,61 @@ def main() -> int:
           mix_q.ok and mix_q.category == im.CATEGORY_TRAVEL,
           "类别=%s 命中=%s" % (mix_q.category, mix_q.category_hit))
 
+    # ================= 用例 R：其他材料内部同类型归拢 =================
+    print()
+    print("-" * 70)
+    print("用例 R：其他材料里同类型的挨在一起，一摞不被拆到两页")
+    print("-" * 70)
+    rdir = workdir / "R_同类归拢"
+    rdir.mkdir(exist_ok=True)
+
+    def make_r_sheet(name: str, title: str, body: str) -> None:
+        doc = fitz.open()
+        pg = doc.new_page(width=A4_W, height=A4_H)
+        pg.insert_text((60, 90), title, fontsize=15, fontname="china-s")
+        pg.insert_text((60, 130), body, fontsize=11, fontname="china-s")
+        doc.save(str(rdir / name))
+        doc.close()
+
+    make_r_sheet("05_行程校验单_A.pdf", "航旅纵横 - 行程校验单", "机票 总金额 2410.0")
+    make_r_sheet("06_订单截图_A.pdf", "订单详情", "待支付 2410.0")
+    make_r_sheet("15_行程校验单_B.pdf", "航旅纵横 - 行程校验单", "机票 总金额 2110.0")
+    make_r_sheet("01_出差审批单_X.pdf", "出差审批单", "五彩湾 20261012-20261018")
+    make_r_sheet("02_出差审批单_Y.pdf", "出差审批单", "五彩湾 20261019-20261021")
+    make_r_sheet("16_订单截图_B.pdf", "订单详情", "已支付 2110.0")
+    make_r_sheet("09_住宿水单_A.pdf", "宾客水单", "酒店名称：桔子酒店 623.76")
+
+    # 故意交错着给：校验单、截图、校验单、审批单、审批单、水单
+    r_order = ["05_行程校验单_A.pdf", "06_订单截图_A.pdf", "15_行程校验单_B.pdf",
+               "01_出差审批单_X.pdf", "02_出差审批单_Y.pdf", "09_住宿水单_A.pdf"]
+    r_srcs = [im.analyze_source(rdir / n, im.Options()) for n in r_order]
+    r_org = im.organize_sources([s for s in r_srcs if s.ok])
+    r_subs = [im.other_subtype(s) for s in r_org]
+    check("R1 其他材料内部按小类归拢（校验单挨着校验单，审批单挨着审批单）",
+          r_subs == ["行程校验单", "行程校验单", "订单截图",
+                     "出差审批单", "出差审批单", "消费明细"],
+          "顺序=%s" % " / ".join(r_subs))
+
+    def r_units(names: Sequence[str]) -> List[List[str]]:
+        srcs = [im.analyze_source(rdir / n, im.Options()) for n in names]
+        org = im.organize_sources(srcs)
+        plan = [(s, pi) for s in org for pi in s.pages if not pi.error]
+        return [[it[0].path.name for it in unit]
+                for unit, _bands, _rot in im.build_units(plan, im.Options())]
+
+    u_mix = r_units(["05_行程校验单_A.pdf", "06_订单截图_A.pdf", "15_行程校验单_B.pdf"])
+    check("R2 一摞放进剩下的条带里放得下时，顺着排、不多占一页",
+          len(u_mix) == 1 and len(u_mix[0]) == 3,
+          "分页=%s" % u_mix)
+
+    u_split = r_units(["05_行程校验单_A.pdf", "06_订单截图_A.pdf",
+                       "15_行程校验单_B.pdf", "16_订单截图_B.pdf"])
+    check("R3 一摞放不下时整摞挪到下一页，不拆成两页",
+          len(u_split) == 2
+          and sorted(u_split[0]) == ["05_行程校验单_A.pdf", "15_行程校验单_B.pdf"]
+          and sorted(u_split[1]) == ["06_订单截图_A.pdf", "16_订单截图_B.pdf"],
+          "分页=%s" % u_split)
+
     # ================= 结果 =================
     print()
     print("=" * 70)
