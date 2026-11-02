@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import math
 import shutil
+import struct
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -192,6 +194,124 @@ def describe(rows: List[dict]) -> str:
         parts.append("P%d %sx%s rot=%s %s" % (
             r["no"], r["w"], r["h"], r["rot"], "横" if r["landscape"] else "纵"))
     return " | ".join(parts)
+
+
+# --------------------------------------------------------------------------
+# 图片样本与像素工具
+# --------------------------------------------------------------------------
+
+IMG_DPI = 150                      # 造图片样本用的渲染精度
+
+
+def make_image_sample(path: Path, w: float, h: float, label: str,
+                      rgb: Tuple[float, float, float] = (0.85, 0.12, 0.12)) -> None:
+    """造一张「照片型」报销材料：先按 w×h（pt）画一页，再渲染成图片。
+
+    环境里没有 PIL，图片一律用 fitz 的渲染器产出；渲染精度固定 IMG_DPI，
+    于是图片按 DPI 换算回原始尺寸正好是 w×h，便于「保持原始尺寸」用例核对。
+    顶部留一条纯色色带，合并后用像素颜色判断这张图有没有真的进来。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc = fitz.open()
+    pg = doc.new_page(width=w, height=h)
+    pg.draw_rect(fitz.Rect(0, 0, w, h * 0.12), color=rgb, fill=rgb, width=0)
+    pg.draw_rect(fitz.Rect(2, 2, w - 2, h - 2), color=(0.2, 0.2, 0.2), width=2)
+    pg.insert_text((w * 0.08, h * 0.32), label,
+                   fontsize=max(10.0, min(26.0, h * 0.05)), fontname="china-s")
+    pg.get_pixmap(dpi=IMG_DPI).save(str(path))
+    doc.close()
+
+
+def sips_convert(src: Path, dst: Path, fmt: str) -> bool:
+    """用 macOS 自带的 sips 转图片格式（bmp / tiff / heic 这些 fitz 不直接输出）。"""
+    try:
+        done = subprocess.run(["sips", "-s", "format", fmt, str(src), "--out", str(dst)],
+                              capture_output=True, timeout=60)
+    except Exception:
+        return False
+    return done.returncode == 0 and dst.exists() and dst.stat().st_size > 0
+
+
+def add_exif_orientation(path: Path, orientation: int = 6) -> bool:
+    """给 JPEG 插一段 APP1 Exif，写进 Orientation 标签（MM 字节序）。
+
+    EXIF 方向是判断「照片有没有被转正」的唯一信号：同一张竖图，只多一个
+    orientation=6，正确实现应当把它横过来显示（内容顶部转到右侧）。
+    """
+    raw = path.read_bytes()
+    if raw[:2] != b"\xff\xd8":
+        return False
+    tiff = b"MM\x00\x2a" + struct.pack(">I", 8)
+    ifd = (struct.pack(">H", 1)
+           + struct.pack(">HHI", 0x0112, 3, 1)      # 1 个条目：Orientation，SHORT
+           + struct.pack(">HH", orientation, 0)     # 值 6（右转 90°），内联存放
+           + struct.pack(">I", 0))                  # 没有下一个 IFD
+    payload = b"Exif\x00\x00" + tiff + ifd
+    app1 = b"\xff\xe1" + struct.pack(">H", len(payload) + 2) + payload
+    path.write_bytes(raw[:2] + app1 + raw[2:])
+    return True
+
+
+def image_page_size(path: Path) -> Tuple[float, float]:
+    """图片按 DPI 换算回 PDF 后应有的原始尺寸（pt）。"""
+    doc = fitz.open(str(path))
+    try:
+        r = doc[0].rect
+        return (round(r.width, 1), round(r.height, 1))
+    finally:
+        doc.close()
+
+
+def color_share(page, rgb: Tuple[float, float, float],
+                dpi: int = 60, tol: int = 60) -> Optional[float]:
+    """页面上接近某个颜色的像素占比；对应的那张图被丢掉时会掉到 0。"""
+    if np is None:
+        return None
+    pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csRGB)
+    a = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)
+    a = a[:, : pix.width * 3].reshape(pix.height, pix.width, 3).astype(np.int16)
+    d = np.abs(a - np.array([int(round(c * 255)) for c in rgb], dtype=np.int16)).max(axis=2)
+    return float((d <= tol).sum()) / float(pix.width * pix.height)
+
+
+def color_center(page, rgb: Tuple[float, float, float],
+                 dpi: int = 50, tol: int = 60) -> Optional[Tuple[float, float]]:
+    """指定颜色的重心（归一化到 0~1），用来判断图片方向转得对不对。"""
+    if np is None:
+        return None
+    pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csRGB)
+    a = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)
+    a = a[:, : pix.width * 3].reshape(pix.height, pix.width, 3).astype(np.int16)
+    d = np.abs(a - np.array([int(round(c * 255)) for c in rgb], dtype=np.int16)).max(axis=2)
+    ys, xs = np.where(d <= tol)
+    if len(xs) == 0:
+        return None
+    return (float(xs.mean()) / pix.width, float(ys.mean()) / pix.height)
+
+
+def band_ink_count(path: Path, page_no: int, bands: int, dpi: int = 50) -> int:
+    """数一页里有几条带子有内容 —— 拼版页应当每条带都有图，少一条就是漏图。
+
+    每条带上下各让出 8%，避开骑在分界线上的裁切虚线，否则虚线自己就把
+    空带子算成有内容了。
+    """
+    doc = fitz.open(str(path))
+    try:
+        pix = doc[page_no].get_pixmap(dpi=dpi, colorspace=fitz.csGRAY)
+        h = pix.height
+        if np is None:
+            return -1
+        a = np.frombuffer(pix.samples, dtype=np.uint8).reshape(h, pix.stride)[:, : pix.width]
+        filled = 0
+        for i in range(bands):
+            top = int(h * (i + 0.08) / bands)
+            bottom = int(h * (i + 1 - 0.08) / bands)
+            seg = a[top:max(top + 1, bottom), :]
+            if seg.size and seg.min() < INK:
+                filled += 1
+        return filled
+    finally:
+        doc.close()
 
 
 def keep_disables_band_note(win) -> bool:
@@ -1118,6 +1238,435 @@ def main() -> int:
                 cfg2.unlink(missing_ok=True)
             else:
                 cfg2.write_text(backup2, encoding="utf-8")
+
+    # ================= 用例 IM：图片作为报销材料 =================
+    print()
+    print("-" * 70)
+    print("用例 IM：图片作为报销材料（图片一律归「其他材料」）")
+    print("-" * 70)
+
+    api_names = ("IMAGE_SUFFIXES", "is_image_path", "is_source_path", "list_sources")
+    missing_api = [n for n in api_names if not hasattr(im, n)]
+    check("IM0 核心已提供图片接口（%s）" % " / ".join(api_names),
+          not missing_api, "缺少 %s" % missing_api)
+    if missing_api:
+        print("   [跳过] 图片用例要等核心接口落地后再跑")
+    else:
+        img_dir = workdir / "图片样本"
+        img_dir.mkdir(exist_ok=True)
+        photo_png = img_dir / "01_照片凭证.png"
+        photo_jpg = img_dir / "02_照片凭证.jpg"
+        make_image_sample(photo_png, 600, 400, "报销凭证照片 A", (0.85, 0.12, 0.12))
+        make_image_sample(photo_jpg, 400, 600, "报销凭证照片 B", (0.12, 0.2, 0.85))
+        (img_dir / "说明.txt").write_text("这不是图片", encoding="utf-8")
+        mixed_pdf = img_dir / "09_混入的其他材料.pdf"
+        _d = fitz.open()
+        _p = _d.new_page(width=A4_W, height=A4_H)
+        _p.insert_text((60, 100), "混在图片文件夹里的其他材料", fontsize=18, fontname="china-s")
+        _d.save(str(mixed_pdf))
+        _d.close()
+
+        suffixes = tuple(str(s).lower() for s in im.IMAGE_SUFFIXES)
+        check("IM1 图片后缀表覆盖常见拍照 / 扫描格式",
+              all(s in suffixes for s in (".jpg", ".jpeg", ".png", ".bmp", ".tif",
+                                          ".tiff", ".webp", ".gif", ".heic", ".heif")),
+              str(suffixes))
+        check("IM2 图片判定与材料判定分开：图片为真、PDF 为假，两者都算可用材料",
+              im.is_image_path(photo_png) and im.is_image_path(photo_jpg)
+              and not im.is_image_path(mixed_pdf)
+              and im.is_source_path(photo_png) and im.is_source_path(photo_jpg)
+              and im.is_source_path(mixed_pdf),
+              "is_image png=%s jpg=%s pdf=%s / is_source png=%s pdf=%s" % (
+                  im.is_image_path(photo_png), im.is_image_path(photo_jpg),
+                  im.is_image_path(mixed_pdf), im.is_source_path(photo_png),
+                  im.is_source_path(mixed_pdf)))
+
+        opts_i = im.Options(scan_output=False, output=workdir / "IM_图片分析.pdf")
+        si_png = im.analyze_source(photo_png, opts_i)
+        si_jpg = im.analyze_source(photo_jpg, opts_i)
+        print("   图片分析：%s" % " / ".join(
+            "%s → %d 页 is_image=%s %s" % (s.path.name, s.page_count,
+                                           getattr(s, "is_image", None), s.category_label)
+            for s in (si_png, si_jpg)))
+        check("IM3 图片可被分析：1 页、is_image=True、页面尺寸可用",
+              si_png.ok and si_png.page_count == 1
+              and getattr(si_png, "is_image", None) is True
+              and bool(si_png.pages) and si_png.pages[0].vis_w > 0 and si_png.pages[0].vis_h > 0
+              and si_jpg.ok and si_jpg.page_count == 1
+              and getattr(si_jpg, "is_image", None) is True,
+              "png：ok=%s 页数=%s is_image=%s / jpg：ok=%s 页数=%s is_image=%s" % (
+                  si_png.ok, si_png.page_count, getattr(si_png, "is_image", None),
+                  si_jpg.ok, si_jpg.page_count, getattr(si_jpg, "is_image", None)))
+        check("IM4 图片一律归「其他材料」，且带一条命中说明",
+              si_png.category == im.CATEGORY_OTHER and bool(si_png.category_hit)
+              and si_jpg.category == im.CATEGORY_OTHER and bool(si_jpg.category_hit),
+              "png=%s/%s jpg=%s/%s" % (si_png.category, si_png.category_hit or "-",
+                                       si_jpg.category, si_jpg.category_hit or "-"))
+        si_pdf = im.analyze_source(mixed_pdf, opts_i)
+        check("IM5 PDF 的分析结果不带图片标记（is_image=False）",
+              si_pdf.ok and getattr(si_pdf, "is_image", None) is False,
+              "ok=%s is_image=%s 页数=%s" % (si_pdf.ok, getattr(si_pdf, "is_image", None),
+                                             si_pdf.page_count))
+
+        listed = im.list_sources(img_dir)
+        listed_names = {p.name for p in listed}
+        only_pdf = im.list_pdfs(img_dir)
+        check("IM6 文件夹模式：list_sources 收到图片与 PDF，list_pdfs 仍只收 PDF",
+              {"01_照片凭证.png", "02_照片凭证.jpg", "09_混入的其他材料.pdf"} <= listed_names
+              and [p.name for p in only_pdf] == ["09_混入的其他材料.pdf"],
+              "list_sources=%s / list_pdfs=%s" % (sorted(listed_names),
+                                                  [p.name for p in only_pdf]))
+        check("IM7 非图片文件（.txt）不进材料列表",
+              "说明.txt" not in listed_names
+              and not any(p.suffix.lower() == ".txt" for p in listed),
+              str(sorted(listed_names)))
+
+        # ---- 两张图片：默认选项下应当拼版成一页 ----
+        band_dir = workdir / "图片拼版"
+        band_a = band_dir / "照片甲.png"
+        band_b = band_dir / "照片乙.png"
+        make_image_sample(band_a, 600, 400, "照片 甲", (0.85, 0.12, 0.12))
+        make_image_sample(band_b, 600, 400, "照片 乙", (0.12, 0.2, 0.85))
+        band_files = im.sort_paths(im.list_sources(band_dir), im.SORT_NATURAL)
+        logs_band: List[str] = []
+        opts_band = im.Options(scan_output=False, size_mode=im.SIZE_A4_ROTATE,
+                               organize=True, band_merge=True,
+                               output=workdir / "IM_图片拼版.pdf")
+        rep_band = im.merge_pdfs(band_files, opts_band, log=logs_band.append)
+        rows_band = inspect(rep_band.output) if rep_band.ok else []
+        print("   输出：%s" % describe(rows_band))
+        check("IM8 两张图片默认拼版成一页（a4-rotate + band_merge）",
+              rep_band.ok and len(rows_band) == 1,
+              "页数=%s" % (len(rows_band) if rep_band.ok else rep_band.error))
+        cut_band = cut_lines(rep_band.output, 0) if rep_band.ok else []
+        check("IM9 两图拼版页画了一条裁切虚线", rep_band.ok and len(cut_band) == 1,
+              str(cut_band))
+        red_share = blue_share = None
+        if rep_band.ok and np is not None:
+            _db = fitz.open(str(rep_band.output))
+            red_share = color_share(_db[0], (0.85, 0.12, 0.12))
+            blue_share = color_share(_db[0], (0.12, 0.2, 0.85))
+            _db.close()
+        if np is None:
+            print("   [跳过] 没有 numpy，做不了像素级判定（IM10 / IM11）")
+        else:
+            check("IM10 两张图片的内容都在同一页上（红色带与蓝色带同时出现）",
+                  red_share is not None and blue_share is not None
+                  and red_share > 0.002 and blue_share > 0.002,
+                  "红 %s / 蓝 %s" % (red_share, blue_share))
+            check("IM11 拼版页的两条带都有内容（没有哪张图被挤没）",
+                  rep_band.ok and band_ink_count(rep_band.output, 0, 2) == 2,
+                  "有内容的带数 %s" % (band_ink_count(rep_band.output, 0, 2)
+                                       if rep_band.ok else "-"))
+
+        # ---- 三张图片：一页三条带 ----
+        band3_dir = workdir / "图片拼版三张"
+        for _i, _rgb in enumerate(((0.85, 0.12, 0.12), (0.12, 0.6, 0.2),
+                                   (0.12, 0.2, 0.85)), 1):
+            make_image_sample(band3_dir / ("照片%d.png" % _i), 600, 400,
+                              "照片 %d" % _i, _rgb)
+        band3_files = im.sort_paths(im.list_sources(band3_dir), im.SORT_NATURAL)
+        rep_b3 = im.merge_pdfs(band3_files, im.Options(
+            scan_output=False, output=workdir / "IM_图片三合一.pdf"))
+        cut_b3 = cut_lines(rep_b3.output, 0) if rep_b3.ok else []
+        check("IM12 三张图片合排一页、两条裁切虚线（拼版页数正确）",
+              rep_b3.ok and rep_b3.written_pages == 1 and len(cut_b3) == 2,
+              "页数=%s 虚线=%s" % (rep_b3.written_pages if rep_b3.ok else rep_b3.error,
+                                   cut_b3))
+
+        # ---- 保持原始尺寸：每张独占一页、尺寸按 DPI 换算 ----
+        keep_dir = workdir / "图片保真"
+        keep_big = keep_dir / "保真甲.png"
+        keep_small = keep_dir / "保真乙.png"
+        make_image_sample(keep_big, 600, 400, "保真 甲", (0.85, 0.12, 0.12))
+        make_image_sample(keep_small, 300, 500, "保真 乙", (0.12, 0.2, 0.85))
+        opts_ikeep = im.Options(scan_output=False, size_mode=im.SIZE_KEEP,
+                                band_merge=True, organize=True,
+                                output=workdir / "IM_图片保真.pdf")
+        rep_keep = im.merge_pdfs([keep_big, keep_small], opts_ikeep)
+        rows_keep = inspect(rep_keep.output) if rep_keep.ok else []
+        print("   输出：%s" % describe(rows_keep))
+        exp_big = image_page_size(keep_big)
+        exp_small = image_page_size(keep_small)
+        check("IM13 保持原始尺寸：每张图片独占一页（不参与拼版）",
+              rep_keep.ok and len(rows_keep) == 2,
+              "页数=%s" % (len(rows_keep) if rep_keep.ok else rep_keep.error))
+        got_big = (rows_keep[0]["w"], rows_keep[0]["h"]) if len(rows_keep) > 0 else None
+        got_small = (rows_keep[1]["w"], rows_keep[1]["h"]) if len(rows_keep) > 1 else None
+        check("IM14 保持原始尺寸：页面尺寸=图片原始 pt（按 DPI 换算，容差 2pt）",
+              got_big is not None and got_small is not None
+              and abs(got_big[0] - exp_big[0]) < 2 and abs(got_big[1] - exp_big[1]) < 2
+              and abs(got_small[0] - exp_small[0]) < 2
+              and abs(got_small[1] - exp_small[1]) < 2,
+              "期望 %s / %s，实际 %s / %s" % (exp_big, exp_small, got_big, got_small))
+        check("IM15 保持原始尺寸：不同尺寸的图片不被统一成 A4",
+              len(rows_keep) == 2
+              and not any(abs(r["w"] - A4_W) < 2 and abs(r["h"] - A4_H) < 2
+                          for r in rows_keep)
+              and abs(rows_keep[0]["w"] - rows_keep[1]["w"]) > 5,
+              describe(rows_keep))
+
+        # ---- 坏图片不能拖垮整批 ----
+        bad_dir = workdir / "图片容错"
+        make_image_sample(bad_dir / "好照片1.png", 600, 400, "好照片 1", (0.85, 0.12, 0.12))
+        make_image_sample(bad_dir / "好照片2.png", 600, 400, "好照片 2", (0.12, 0.2, 0.85))
+        (bad_dir / "坏照片.jpg").write_bytes(
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00" + b"not a real jpeg body" * 8)
+        bad_files = im.sort_paths(im.list_sources(bad_dir), im.SORT_NATURAL)
+        rep_bad = im.merge_pdfs(bad_files, im.Options(
+            scan_output=False, size_mode=im.SIZE_KEEP,
+            output=workdir / "IM_图片容错.pdf"))
+        check("IM16 坏图片被跳过，其余图片仍合并成功（不拖垮整批）",
+              rep_bad.ok and rep_bad.written_pages == 2
+              and any("坏照片" in w for w, _ in rep_bad.skipped),
+              "页数=%s 跳过=%s" % (rep_bad.written_pages if rep_bad.ok else rep_bad.error,
+                                   rep_bad.skipped))
+
+        # ---- 图片强制归其他材料，不被文件名关键词抢走 ----
+        force_dir = workdir / "图片分类"
+        hotel_img = force_dir / "酒店发票.png"
+        flight_img = force_dir / "机票行程单.jpg"
+        make_image_sample(hotel_img, 600, 400, "酒店 住宿费 854.04", (0.85, 0.12, 0.12))
+        make_image_sample(flight_img, 600, 400, "航空运输电子客票行程单",
+                          (0.12, 0.2, 0.85))
+        si_hotel = im.analyze_source(hotel_img, opts_i)
+        si_flight = im.analyze_source(flight_img, opts_i)
+        check("IM17 文件名带「酒店」「机票」的图片仍强制归其他材料（分类不被关键词抢走）",
+              getattr(si_hotel, "is_image", None) is True
+              and si_hotel.category == im.CATEGORY_OTHER
+              and getattr(si_flight, "is_image", None) is True
+              and si_flight.category == im.CATEGORY_OTHER,
+              "酒店图=%s/%s 机票图=%s/%s" % (
+                  si_hotel.category, si_hotel.category_hit or "-",
+                  si_flight.category, si_flight.category_hit or "-"))
+
+        # ---- bmp / tiff / heic：需要真实格式，macOS 用 sips 生成 ----
+        if sys.platform != "darwin":
+            print("   [跳过] 非 macOS 环境造不出真实的 bmp / tiff / heic 样本")
+        else:
+            src_png = img_dir / "_临时转格式.png"
+            make_image_sample(src_png, 500, 350, "票据照片", (0.2, 0.6, 0.2))
+            fmt_paths = []
+            for _fmt, _name in (("bmp", "03_票据照片.bmp"), ("tiff", "04_票据照片.tiff")):
+                _dst = img_dir / _name
+                if sips_convert(src_png, _dst, _fmt):
+                    fmt_paths.append(_dst)
+            src_png.unlink(missing_ok=True)
+            fmt_ok = []
+            for _p in fmt_paths:
+                _si = im.analyze_source(_p, opts_i)
+                fmt_ok.append(_si.ok and _si.page_count == 1
+                              and getattr(_si, "is_image", None) is True
+                              and _si.category == im.CATEGORY_OTHER)
+            check("IM18 bmp / tiff 图片同样可分析与归类（macOS 用 sips 生成真实格式）",
+                  len(fmt_paths) == 2 and all(fmt_ok),
+                  "生成 %s / 分析 %s" % ([p.name for p in fmt_paths], fmt_ok))
+            if fmt_paths:
+                rep_fmt = im.merge_pdfs(fmt_paths, im.Options(
+                    scan_output=False, size_mode=im.SIZE_KEEP,
+                    output=workdir / "IM_bmp_tiff.pdf"))
+                check("IM19 bmp / tiff 图片可正常合并",
+                      rep_fmt.ok and rep_fmt.written_pages == len(fmt_paths),
+                      "页数=%s" % (rep_fmt.written_pages if rep_fmt.ok else rep_fmt.error))
+
+            heic = img_dir / "05_手机照片.heic"
+            src_png2 = img_dir / "_临时heic.png"
+            make_image_sample(src_png2, 500, 350, "HEIC 手机照片", (0.2, 0.2, 0.6))
+            got_heic = sips_convert(src_png2, heic, "heic")
+            src_png2.unlink(missing_ok=True)
+            if not got_heic:
+                print("   [跳过] sips 生成不出 .heic 样本")
+            else:
+                si_heic = im.analyze_source(heic, opts_i)
+                check("IM20 HEIC 在 macOS 上自动转 PNG 后可分析（1 页 / 图片 / 其他材料）",
+                      si_heic.ok and si_heic.page_count == 1
+                      and getattr(si_heic, "is_image", None) is True
+                      and si_heic.category == im.CATEGORY_OTHER,
+                      "ok=%s 错误=%s is_image=%s 页数=%s 类别=%s" % (
+                          si_heic.ok, si_heic.error or "-",
+                          getattr(si_heic, "is_image", None), si_heic.page_count,
+                          si_heic.category))
+                rep_heic = im.merge_pdfs([heic], im.Options(
+                    scan_output=False, size_mode=im.SIZE_KEEP,
+                    output=workdir / "IM_heic.pdf"))
+                check("IM21 HEIC 图片可正常合并出一页",
+                      rep_heic.ok and rep_heic.written_pages == 1,
+                      "页数=%s" % (rep_heic.written_pages if rep_heic.ok
+                                   else rep_heic.error))
+
+        # ---- EXIF 方向：同一张竖图，只差一个 orientation=6 ----
+        exif_dir = workdir / "图片方向"
+        ctrl_jpg = exif_dir / "方向对照.jpg"
+        rot_jpg = exif_dir / "方向旋转.jpg"
+        make_image_sample(ctrl_jpg, 300, 500, "方向测试", (0.85, 0.12, 0.12))
+        shutil.copyfile(ctrl_jpg, rot_jpg)
+        exif_done = add_exif_orientation(rot_jpg, 6)
+        rep_exif = im.merge_pdfs([ctrl_jpg, rot_jpg], im.Options(
+            scan_output=False, size_mode=im.SIZE_KEEP,
+            output=workdir / "IM_图片方向.pdf"))
+        rows_exif = inspect(rep_exif.output) if rep_exif.ok else []
+        print("   输出：%s" % describe(rows_exif))
+        check("IM22 EXIF orientation=6 的 JPEG 已按方向转正（对照组竖、该组横）",
+              exif_done and rep_exif.ok and len(rows_exif) == 2
+              and rows_exif[0]["landscape"] is False and rows_exif[1]["landscape"] is True,
+              "对照=%s 旋转=%s" % (
+                  ("横" if rows_exif[0]["landscape"] else "纵") if len(rows_exif) > 0 else "-",
+                  ("横" if rows_exif[1]["landscape"] else "纵") if len(rows_exif) > 1 else "-"))
+        center_red = None
+        if rep_exif.ok and len(rows_exif) == 2 and np is not None:
+            _dx = fitz.open(str(rep_exif.output))
+            center_red = color_center(_dx[1], (0.85, 0.12, 0.12))
+            _dx.close()
+        if np is None:
+            print("   [跳过] 没有 numpy，做不了色带位置判定（IM23）")
+        else:
+            check("IM23 转正后原本在顶部的色带落到页面右侧（像素真的转了，不只是换尺寸）",
+                  center_red is not None and center_red[0] > 0.5,
+                  "色带重心 x=%s" % (round(center_red[0], 2) if center_red else "-"))
+
+        # ---- 图片与同类 PDF 混排 ----
+        mix_dir = workdir / "图片与PDF混排"
+        make_image_sample(mix_dir / "照片1.png", 600, 400, "混排甲", (0.85, 0.12, 0.12))
+        make_image_sample(mix_dir / "照片2.png", 600, 400, "混排乙", (0.12, 0.2, 0.85))
+        _d = fitz.open()
+        _p = _d.new_page(width=A4_W, height=A4_H)
+        _p.insert_text((60, 100), "出差情况说明材料", fontsize=18, fontname="china-s")
+        _d.save(str(mix_dir / "出差说明.pdf"))
+        _d.close()
+        mix_files = im.sort_paths(im.list_sources(mix_dir), im.SORT_NATURAL)
+        rep_mix = im.merge_pdfs(mix_files, im.Options(
+            scan_output=False, output=workdir / "IM_混排.pdf"))
+        cut_mix = cut_lines(rep_mix.output, 0) if rep_mix.ok else []
+        check("IM24 图片与同类 PDF（其他材料）混排：三张仍合成一页",
+              rep_mix.ok and rep_mix.written_pages == 1 and len(cut_mix) == 2,
+              "页数=%s 虚线=%s" % (rep_mix.written_pages if rep_mix.ok else rep_mix.error,
+                                   cut_mix))
+        check("IM25 合并报告的动作明细里写明了图片材料",
+              rep_band.ok and any("照片甲" in a for a in rep_band.actions),
+              str(rep_band.actions[:3]))
+        check("IM26 日志里说明了图片按「其他材料」拼版",
+              any("拼版" in ln and "其他材料" in ln for ln in logs_band),
+              str(logs_band[:3]))
+
+        # ---- 新增字段与报告文本：图片要能被人和程序都认出来 ----
+        check("IM27 材料类型标签：图片标「图片」、PDF 标「PDF」",
+              getattr(si_png, "kind_label", None) == "图片"
+              and getattr(si_pdf, "kind_label", None) == "PDF",
+              "png=%s pdf=%s" % (getattr(si_png, "kind_label", None),
+                                 getattr(si_pdf, "kind_label", None)))
+        check("IM28 合并报告统计了可用图片数",
+              rep_band.ok and getattr(rep_band, "image_files", None) == 2
+              and rep_keep.ok and getattr(rep_keep, "image_files", None) == 2,
+              "拼版=%s 保真=%s" % (getattr(rep_band, "image_files", None),
+                                   getattr(rep_keep, "image_files", None)))
+        report_text = ""
+        if rep_band.ok and rep_band.report_path:
+            report_text = Path(rep_band.report_path).read_text(encoding="utf-8")
+        check("IM29 报告正文写了图片材料数量与处理口径",
+              "图片材料：2 个" in report_text,
+              " / ".join(ln for ln in report_text.splitlines() if "图片材料" in ln)
+              or "报告里没有「图片材料」一行")
+        check("IM30 单张图片页的动作行标注「图片按其他材料处理」",
+              rep_keep.ok and any("图片按其他材料处理" in a for a in rep_keep.actions),
+              str(rep_keep.actions))
+
+        # ---- WebP：sips 能读不能写，造样本要用 cwebp；没有就跳过 ----
+        webp_tool = shutil.which("cwebp")
+        if not webp_tool:
+            print("   [跳过] 本机没有 cwebp，造不出真实的 .webp 样本")
+        else:
+            webp_png = img_dir / "_临时webp.png"
+            webp_path = img_dir / "06_网页截图.webp"
+            make_image_sample(webp_png, 500, 350, "网页截图", (0.6, 0.2, 0.5))
+            made_webp = subprocess.run([webp_tool, "-quiet", str(webp_png), "-o", str(webp_path)],
+                                       capture_output=True, timeout=60)
+            webp_png.unlink(missing_ok=True)
+            if made_webp.returncode != 0 or not webp_path.exists():
+                print("   [跳过] cwebp 生成不出 .webp 样本")
+            else:
+                si_webp = im.analyze_source(webp_path, opts_i)
+                check("IM31 WebP 图片经系统转换后可分析（1 页 / 图片 / 其他材料）",
+                      si_webp.ok and si_webp.page_count == 1
+                      and getattr(si_webp, "is_image", None) is True
+                      and si_webp.category == im.CATEGORY_OTHER,
+                      "ok=%s 错误=%s 页数=%s" % (si_webp.ok, si_webp.error or "-",
+                                                 si_webp.page_count))
+                rep_webp = im.merge_pdfs([webp_path], im.Options(
+                    scan_output=False, size_mode=im.SIZE_KEEP,
+                    output=workdir / "IM_webp.pdf"))
+                check("IM32 WebP 图片可正常合并出一页",
+                      rep_webp.ok and rep_webp.written_pages == 1,
+                      "页数=%s" % (rep_webp.written_pages if rep_webp.ok
+                                   else rep_webp.error))
+
+        # ---- 转换器链路：没有 sips 时兜底，一个都没有时给可照做的提示 ----
+        probe = img_dir / "_临时链路.png"
+        make_image_sample(probe, 400, 300, "链路探测")
+        probe_webp = img_dir / "_临时链路.webp"
+        made = shutil.which("cwebp") and subprocess.run(
+            [shutil.which("cwebp"), "-quiet", str(probe), "-o", str(probe_webp)],
+            capture_output=True, timeout=60).returncode == 0
+        if not made:
+            print("   [跳过] 造不出 .webp，跳过转换器链路用例")
+        else:
+            # 这台机器上到底有没有「后备」转换器（Pillow 或命令行工具），
+            # 一个都没有就别拿 IM35 去冤枉代码 —— 那是环境问题，不是缺陷。
+            try:
+                import PIL  # noqa: F401
+                has_fallback = True
+            except Exception:
+                has_fallback = any(shutil.which(n) for n in
+                                   ("magick", "convert", "heif-convert", "dwebp", "ffmpeg"))
+            real_sips, real_which = im._sips_path, im.shutil.which
+            try:
+                # 假装不是 mac：没有 sips，只剩 Pillow / 命令行工具链
+                im._sips_path = lambda: None
+                im._CONVERT_CACHE.clear()
+                if not has_fallback:
+                    print("   [跳过] 本机既没 Pillow 也没命令行转换器，无法验证后备链路")
+                else:
+                    si_chain = im.analyze_source(probe_webp, opts_i)
+                    check("IM35 非 macOS 上仍能靠后备转换器处理 WebP（不再直接判死）",
+                          si_chain.ok and si_chain.page_count == 1,
+                          "ok=%s 错误=%s" % (si_chain.ok, si_chain.error or "-"))
+
+                # 连后备转换器也没有：必须是能照着做的提示，而不是原始异常
+                im.shutil.which = lambda name: None
+                im._CONVERT_CACHE.clear()
+                si_none = im.analyze_source(probe_webp, opts_i)
+                check("IM36 一个转换器都没有时给出可照做的提示（提示装 Pillow / ImageMagick）",
+                      (not si_none.ok) and "Pillow" in (si_none.error or "")
+                      and "JPG" in (si_none.error or ""),
+                      si_none.error or "-")
+            finally:
+                im._sips_path, im.shutil.which = real_sips, real_which
+                im._CONVERT_CACHE.clear()
+            probe_webp.unlink(missing_ok=True)
+        probe.unlink(missing_ok=True)
+
+        # ---- 超 A4 的图片：keep 模式下不能产出「1.4 米宽的纸」 ----
+        huge_dir = workdir / "超大图片"
+        huge = huge_dir / "手机原图.png"
+        make_image_sample(huge, 1600, 1200, "手机原图 超 A4", (0.2, 0.55, 0.3))
+        si_huge = im.analyze_source(huge, opts_i)
+        huge_pt = image_page_size(huge)
+        rep_huge = im.merge_pdfs([huge], im.Options(
+            scan_output=False, size_mode=im.SIZE_KEEP,
+            output=workdir / "IM_超大图片.pdf"))
+        rows_huge = inspect(rep_huge.output) if rep_huge.ok else []
+        check("IM33 超 A4 的图片在 keep 模式下被等比缩到 A4 以内（不产出 1.4 米宽的页）",
+              rep_huge.ok and len(rows_huge) == 1
+              and rows_huge[0]["w"] <= A4_H + 2 and rows_huge[0]["h"] <= A4_W + 2
+              and rows_huge[0]["w"] > A4_H * 0.9,
+              "原始 %s pt → 输出 %s" % (
+                  tuple(round(v) for v in huge_pt),
+                  (round(rows_huge[0]["w"]), round(rows_huge[0]["h"])) if rows_huge else "-"))
+        ratio_in = huge_pt[0] / huge_pt[1] if huge_pt[1] else 0
+        ratio_out = (rows_huge[0]["w"] / rows_huge[0]["h"]) if rows_huge else 0
+        check("IM34 缩小后的页面保持原图长宽比，且动作行写明了缩放比例",
+              abs(ratio_in - ratio_out) < 0.02
+              and any("等比缩小" in a for a in rep_huge.actions),
+              "长宽比 %0.3f → %0.3f；%s" % (ratio_in, ratio_out, rep_huge.actions))
 
     # ================= 结果 =================
     print()

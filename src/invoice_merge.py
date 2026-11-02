@@ -2,7 +2,9 @@
 # -*- coding: utf-8 -*-
 """发票合并小助手 (Invoice Merge Assistant)
 
-把多张发票 PDF 合并成一个 PDF，并自动处理横向 / 纵向页面的方向与尺寸问题。
+把多张发票 PDF 与图片（手机拍的照片、扫描件）合并成一个 PDF，并自动处理横向 /
+纵向页面的方向与尺寸问题。图片一律按「其他材料」对待：同样参与分类排序、拼版、
+转扫描件，一张图片算一页。
 
 两种用法
 --------
@@ -28,22 +30,26 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import locale
 import math
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import traceback
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # --------------------------------------------------------------------------
 # 依赖
@@ -73,6 +79,15 @@ except Exception:  # pragma: no cover - numpy 只是加速项
 
 A4_W, A4_H = 595.276, 841.89          # A4 纵向，单位 pt
 MM = 72.0 / 25.4                       # 1 毫米对应的 pt
+
+# 可作为报销材料的文件：PDF，以及手机拍照 / 扫描得到的图片。
+# 图片在打开时先转成「一页 PDF」，之后拼版、扫描件、打印全走同一条流水线，
+# 下游代码不需要区分「这是 PDF 还是图片」。
+IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff",
+                  ".webp", ".gif", ".heic", ".heif")
+SOURCE_SUFFIXES = (".pdf",) + IMAGE_SUFFIXES
+# 这些格式 PyMuPDF 解不了（没编进解码器），macOS 上借系统 sips 先转 PNG。
+SYSTEM_DECODE_SUFFIXES = (".heic", ".heif", ".webp")
 
 SIZE_KEEP = "keep"                     # 保持每页原始尺寸与方向
 SIZE_A4_ROTATE = "a4-rotate"           # 统一 A4 纵向，横向页内容旋转 90° 填满
@@ -261,10 +276,15 @@ class SourceInfo:
     error: str = ""
     category: str = CATEGORY_OTHER
     category_hit: str = ""              # 命中的关键词，便于人工核对分类
+    is_image: bool = False              # 输入是图片（一张图 = 一页，归「其他材料」）
 
     @property
     def ok(self) -> bool:
         return not self.error
+
+    @property
+    def kind_label(self) -> str:
+        return "图片" if self.is_image else "PDF"
 
     @property
     def category_label(self) -> str:
@@ -309,6 +329,7 @@ class MergeReport:
     output: Optional[Path] = None
     total_files: int = 0
     ok_files: int = 0
+    image_files: int = 0                                             # 其中图片材料数
     total_pages: int = 0
     written_pages: int = 0
     skipped: List[Tuple[str, str]] = field(default_factory=list)     # (文件, 原因)
@@ -448,8 +469,21 @@ def is_tool_output(path: Path) -> bool:
     return any(marker in stem for marker in OUTPUT_MARKERS)
 
 
-def list_pdfs(folder: Path, recursive: bool = False) -> List[Path]:
-    """列出文件夹内的 PDF（忽略隐藏文件、Office 临时文件与本工具的输出）。"""
+def is_image_path(path: Path) -> bool:
+    """是不是图片材料（按后缀判断，大小写不敏感）。"""
+    return Path(path).suffix.lower() in IMAGE_SUFFIXES
+
+
+def is_source_path(path: Path) -> bool:
+    """能不能作为材料：PDF 或图片。"""
+    return Path(path).suffix.lower() in SOURCE_SUFFIXES
+
+
+def list_sources(folder: Path, recursive: bool = False) -> List[Path]:
+    """列出文件夹内可作为材料的文件：PDF 与图片。
+
+    忽略隐藏文件、Office 临时文件（~$）与本工具自己的输出。
+    """
     folder = Path(folder)
     found: List[Path] = []
     pattern = "**/*" if recursive else "*"
@@ -458,12 +492,17 @@ def list_pdfs(folder: Path, recursive: bool = False) -> List[Path]:
             continue
         if p.name.startswith(".") or p.name.startswith("~$"):
             continue
-        if p.suffix.lower() != ".pdf":
+        if not is_source_path(p):
             continue
         if is_tool_output(p):
             continue
         found.append(p)
     return found
+
+
+def list_pdfs(folder: Path, recursive: bool = False) -> List[Path]:
+    """只列出 PDF（保留旧语义：只认 PDF，不把图片混进来）。"""
+    return [p for p in list_sources(folder, recursive) if not is_image_path(p)]
 
 
 def human_size(n: int) -> str:
@@ -569,6 +608,189 @@ def _open_pdf(path: Path):
         doc.close()
         raise PdfEmptyError("文档没有任何页面")
     return doc
+
+
+# 需要外部解码器的图片格式（MuPDF 没编进解码器）的临时目录与缓存：
+# 分析、合并各要打开一次，转好的 PNG 缓存起来别转两遍。
+_TEMP_DIR: Optional[Path] = None
+_CONVERT_CACHE: Dict[Path, Path] = {}
+
+
+def _temp_dir() -> Path:
+    global _TEMP_DIR
+    if _TEMP_DIR is None or not _TEMP_DIR.exists():
+        _TEMP_DIR = Path(tempfile.mkdtemp(prefix="invoice_merge_img_"))
+        atexit.register(shutil.rmtree, str(_TEMP_DIR), True)
+    return _TEMP_DIR
+
+
+def _sips_path() -> Optional[str]:
+    """macOS 上返回系统 sips 的路径，其他平台返回 None。
+
+    单独抽成函数是为了让自检能模拟「这台机器不是 mac」——
+    直接改 sys.platform 会连带影响 shutil / subprocess 的内部判断。
+    """
+    if sys.platform != "darwin":
+        return None
+    return shutil.which("sips")
+
+
+def _image_dpi(img) -> Optional[Tuple[float, float]]:
+    """读出图片自己声明的分辨率（每英寸像素），读不到就返回 None。
+
+    iPhone 的 HEIC 不写 info["dpi"]，而是把分辨率放在 EXIF 的 282/283 标签里；
+    只看 info 会让同一张照片在 macOS（sips，读得到）和 Windows（Pillow，读不到）
+    上算出不同的页面尺寸。
+    """
+    pair: Optional[Tuple[float, float]] = None
+    dpi = img.info.get("dpi")
+    try:
+        if dpi:
+            pair = (float(dpi[0]), float(dpi[1]))
+    except Exception:
+        pair = None
+    if pair is None:
+        try:
+            ex = img.getexif()
+            x, y = ex.get(282), ex.get(283)
+            unit = ex.get(296) or 2          # 2 = 英寸，3 = 厘米
+            if x and y:
+                pair = (float(x), float(y))
+                if unit == 3:                # 每厘米 → 每英寸
+                    pair = (pair[0] * 2.54, pair[1] * 2.54)
+        except Exception:
+            pair = None
+    if pair is None or not all(1.0 <= v <= 2400.0 for v in pair):
+        return None
+    return pair
+
+
+def _convert_with_pillow(path: Path, target: Path) -> bool:
+    """有 Pillow 就用它转（Windows 上最省事的一条路；没装就跳过）。
+
+    HEIC 还要额外装 pillow-heif，装了就在这里注册解码器；PNG 里不带 EXIF，
+    所以必须先 exif_transpose，否则手机竖拍的照片会躺着出去 ——
+    走 MuPDF 那条路时方向是解码器自动应用的，两条路的结果必须一致。
+    """
+    try:
+        from PIL import Image, ImageOps  # type: ignore[import-not-found]
+    except Exception:
+        return False
+    try:
+        import pillow_heif  # type: ignore[import-not-found]
+
+        pillow_heif.register_heif_opener()
+    except Exception:
+        pass
+    try:
+        with Image.open(path) as img:
+            # Pillow 存 PNG 默认写 96dpi，会让同一张图经这条路转完变大 4/3；
+            # 沿用图片自己的 DPI，没有就按 72 —— 与走 MuPDF / sips 的结果对齐。
+            pair = _image_dpi(img)
+            opts = {"dpi": pair} if pair else {}
+            ImageOps.exif_transpose(img).convert("RGB").save(target, "PNG", **opts)
+        return target.exists() and target.stat().st_size > 0
+    except Exception:
+        return False
+
+
+def _convert_with_cli(path: Path, target: Path) -> bool:
+    """挨个试系统里可能装了的命令行转换器 —— 只要有任意一个能出图就算成功。
+
+    macOS 自带 sips，能解 HEIC 与 WebP；装了 ImageMagick / libheif / ffmpeg 的
+    Windows / Linux 机器也能走到这里，不必让用户先手动转格式。
+    """
+    sips = _sips_path()
+    plans = [["sips", "-s", "format", "png", str(path), "--out", str(target)]] if sips else []
+    magick = shutil.which("magick") or shutil.which("convert")
+    if magick:
+        plans.append([magick, str(path), str(target)])
+    heif = shutil.which("heif-convert")
+    if heif:
+        plans.append([heif, str(path), str(target)])
+    dwebp = shutil.which("dwebp")
+    if dwebp and path.suffix.lower() == ".webp":
+        plans.append([dwebp, "-quiet", str(path), "-o", str(target)])
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        plans.append([ffmpeg, "-y", "-loglevel", "error", "-i", str(path),
+                      "-frames:v", "1", "-update", "1", str(target)])
+    for cmd in plans:
+        target.unlink(missing_ok=True)
+        try:
+            done = subprocess.run(cmd, capture_output=True, timeout=60)
+        except Exception:
+            continue
+        if done.returncode == 0 and target.exists() and target.stat().st_size > 0:
+            return True
+    return False
+
+
+def _system_convert(path: Path) -> Path:
+    """把 MuPDF 解不了的图片（HEIC / HEIF / WebP）先转成 PNG 再读。
+
+    HEIC 是 iPhone 的默认格式，WebP 在 PyMuPDF 的多数构建里都没编进解码器。
+    这里按「Pillow → 系统命令行工具」的顺序试，能转就转；全都不可用时给一句
+    能直接照做的提示，而不是抛一句看不懂的异常。
+    """
+    cached = _CONVERT_CACHE.get(path)
+    if cached is not None and cached.exists():
+        return cached
+    label = path.suffix.lstrip(".").upper() or "该"
+    stem = re.sub(r"[^0-9A-Za-z_-]+", "_", path.stem)[:40] or "image"
+    target = _temp_dir() / ("%s_%s.png" % (stem, uuid.uuid4().hex[:8]))
+    if _sips_path():
+        converted = _convert_with_cli(path, target) or _convert_with_pillow(path, target)
+    else:
+        converted = _convert_with_pillow(path, target) or _convert_with_cli(path, target)
+    if not converted:
+        target.unlink(missing_ok=True)
+        raise AnalyzeError(
+            "%s 图片需要先转成 JPG 或 PNG 再合并（本机没有可用的转换器："
+            "装 Pillow 或 ImageMagick 后可自动处理）" % label)
+    _CONVERT_CACHE[path] = target
+    return target
+
+
+def _open_source(path: Path):
+    """打开材料：PDF 原样打开，图片转成「一页 PDF」再返回。
+
+    图片转 PDF 之后，insert_pdf / show_pdf_page 这些下游代码不必区分来源类型；
+    图片的 EXIF 方向由 MuPDF 解码时应用，手机竖拍的照片不会横躺。
+    """
+    path = Path(path)
+    if not is_image_path(path):
+        return _open_pdf(path)
+
+    target = _system_convert(path) if path.suffix.lower() in SYSTEM_DECODE_SUFFIXES else path
+    try:
+        doc = fitz.open(str(target))
+    except Exception as exc:
+        raise AnalyzeError("无法读取图片（格式不受支持或文件已损坏）：%s"
+                           % (str(exc) or exc.__class__.__name__)) from exc
+    try:
+        if doc.page_count <= 0:
+            raise PdfEmptyError("图片没有可用的画面")
+        pdf_bytes = doc.convert_to_pdf()
+    except AnalyzeError:
+        raise
+    except Exception as exc:
+        raise AnalyzeError("无法读取图片（格式不受支持或文件已损坏）：%s"
+                           % (str(exc) or exc.__class__.__name__)) from exc
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+
+    try:
+        pdf = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as exc:
+        raise AnalyzeError("图片转换 PDF 失败：%s" % exc) from exc
+    if pdf.page_count <= 0:
+        pdf.close()
+        raise PdfEmptyError("图片转换后没有页面")
+    return pdf
 
 
 def _ink_box(page, dpi: int) -> Optional[fitz.Rect]:
@@ -745,8 +967,10 @@ def _analyze_page(doc, page_no: int, source: Path, opts: Options) -> PageInfo:
                 info.warnings.append(
                     "内容在页面中呈 %d° 摆放，已扶正为%s页" % (display, "横" if target_rot % 180 else "纵")
                 )
-    elif angle is None and ink is not None:
-        # 无文本层：只能用内容形状做粗判，属于低置信度，仅提示不改动
+    elif angle is None and ink is not None and not is_image_path(source):
+        # 无文本层：只能用内容形状做粗判，属于低置信度，仅提示不改动。
+        # 图片跳过这条：EXIF 方向已由解码器应用，照片内容本就未必填满画面，
+        # 再按宽高比提示「方向可能异常」只会制造噪音。
         w = ink.x1 - ink.x0
         h = ink.y1 - ink.y0
         if h > 1 and w > 1:
@@ -768,11 +992,12 @@ def analyze_source(path: Path, opts: Options) -> SourceInfo:
     if not path.is_file():
         info.error = "不是文件"
         return info
-    if path.suffix.lower() != ".pdf":
-        info.error = "不是 PDF 文件"
+    if not is_source_path(path):
+        info.error = "不是 PDF 或图片文件"
         return info
+    info.is_image = is_image_path(path)
     try:
-        doc = _open_pdf(path)
+        doc = _open_source(path)
     except AnalyzeError as exc:
         info.error = str(exc)
         return info
@@ -782,10 +1007,15 @@ def analyze_source(path: Path, opts: Options) -> SourceInfo:
 
     try:
         info.page_count = doc.page_count
-        # 先认类别：文件名看不出用途的（如"结账单20260731.pdf"）要靠正文里的关键词
-        info.category, info.category_hit = classify_document(
-            path.name, _document_digest(doc)
-        )
+        if info.is_image:
+            # 图片不参与关键词分类：一张照片不是「酒店发票」也不是「火车票」，
+            # 用户明确要求图片一律当「其他材料」，可拼版、排在封面之前。
+            info.category, info.category_hit = CATEGORY_OTHER, "图片（按其他材料）"
+        else:
+            # 先认类别：文件名看不出用途的（如"结账单20260731.pdf"）要靠正文里的关键词
+            info.category, info.category_hit = classify_document(
+                path.name, _document_digest(doc)
+            )
         for pno in range(doc.page_count):
             try:
                 info.pages.append(_analyze_page(doc, pno, path, opts))
@@ -822,10 +1052,51 @@ def portrait_target_rotation(info: PageInfo) -> int:
     return target if info.landscape else 0
 
 
+def _a4_cap(w: float, h: float) -> Tuple[float, float]:
+    """同样摆向下 A4 的长宽（横向内容拿横版 A4 当上限）。"""
+    return (A4_H, A4_W) if w > h else (A4_W, A4_H)
+
+
+def image_exceeds_a4(pi: "PageInfo") -> bool:
+    """图片的原始尺寸是否超过 A4 —— 手机原图按 72dpi 折算常有 4000pt 见方，
+    直接照搬会印出一张 1.4 米宽的纸，那已经不是「保持原始尺寸」而是失控。"""
+    if pi.vis_w <= 0 or pi.vis_h <= 0:
+        return False
+    cap_w, cap_h = _a4_cap(pi.vis_w, pi.vis_h)
+    return pi.vis_w > cap_w + 0.5 or pi.vis_h > cap_h + 0.5
+
+
+def write_image_keep_page(out, doc, pi: "PageInfo") -> float:
+    """「保持原始尺寸」模式下写一张超 A4 的图片：按 A4 上限等比缩小后单独成页。
+
+    只缩不放，且保持长宽比；返回缩放比例（1.0 表示没缩）。
+    """
+    w, h = pi.vis_w, pi.vis_h
+    cap_w, cap_h = _a4_cap(w, h)
+    scale = min(1.0, cap_w / w, cap_h / h) if w > 0 and h > 0 else 1.0
+    tmp = fitz.open()
+    stage = fitz.open()
+    try:
+        tmp.insert_pdf(doc, from_page=pi.page_no, to_page=pi.page_no)
+        tp = tmp[0]
+        if pi.new_crop:
+            tp.set_cropbox(fitz.Rect(*pi.new_crop))
+        tp.remove_rotation()
+        # 先在暂存文档里把这一页排好，成功后再整体插进 out ——
+        # 否则中途出错会在输出里留下半张空白页（这条坑在拼版路径上踩过）。
+        newpage = stage.new_page(width=max(1.0, w * scale), height=max(1.0, h * scale))
+        newpage.show_pdf_page(newpage.rect, tmp, 0, keep_proportion=True)
+        out.insert_pdf(stage)
+    finally:
+        stage.close()
+        tmp.close()
+    return scale
+
+
 def _open_cached(cache: Dict[Path, object], path: Path):
     doc = cache.get(path)
     if doc is None:
-        doc = _open_pdf(path)
+        doc = _open_source(path)
         cache[path] = doc
     return doc
 
@@ -1029,6 +1300,8 @@ def merge_pdfs(
         if si.ok:
             report.ok_files += 1
             report.total_pages += si.page_count
+            if si.is_image:
+                report.image_files += 1
         else:
             report.skipped.append((p.name, si.error))
             say("  跳过 %s：%s" % (p.name, si.error))
@@ -1036,7 +1309,7 @@ def merge_pdfs(
             progress(i, len(paths))
 
     if report.ok_files == 0:
-        report.error = "没有任何可用的 PDF 文件"
+        report.error = "没有任何可用的 PDF 或图片文件"
         return report
 
     # 按报销业务顺序整理材料：酒店发票 → 差旅费报销单 → 火车 / 飞机 → 其他 → 封面
@@ -1098,10 +1371,12 @@ def merge_pdfs(
                                      opts, doc_cache, margin)
                     report.written_pages += 1
                     names = " + ".join(u[0].path.name for u in unit)
+                    imgs = sum(1 for u in unit if u[0].is_image)
                     report.actions.append(
-                        "第%d页 拼版（%d 张合排%s，带间裁切虚线）：%s"
+                        "第%d页 拼版（%d 张合排%s%s，带间裁切虚线）：%s"
                         % (order, len(unit),
-                           "、竖版转 90°" if allow_rotate else "", names))
+                           "、竖版转 90°" if allow_rotate else "",
+                           "、含图片 %d 张" % imgs if imgs else "", names))
                     for u in unit:
                         for w in u[1].warnings:
                             report.warnings.append(
@@ -1112,7 +1387,12 @@ def merge_pdfs(
 
                 doc = _open_cached(doc_cache, si.path)
 
-                if opts.size_mode == SIZE_KEEP:
+                shrunk = 1.0
+                if opts.size_mode == SIZE_KEEP and si.is_image and image_exceeds_a4(pi):
+                    # 图片没有「原始纸张尺寸」可言：手机原图按 72dpi 折算是 1.4 米宽的纸。
+                    # 按 A4 上限等比缩小，既保留整张照片，又不产出没法打印的页面。
+                    shrunk = write_image_keep_page(out, doc, pi)
+                elif opts.size_mode == SIZE_KEEP:
                     # 保真路径：原样复制页面对象，零重绘、零质量损失
                     out.insert_pdf(doc, from_page=pi.page_no, to_page=pi.page_no)
                     page = out[out.page_count - 1]
@@ -1144,6 +1424,10 @@ def merge_pdfs(
 
                 report.written_pages += 1
                 acts = []
+                if si.is_image:
+                    acts.append("图片按其他材料处理")
+                if shrunk < 1.0 - 1e-9:
+                    acts.append("原始尺寸超 A4，已等比缩小到约 %d%%" % round(shrunk * 100))
                 if pi.new_crop:
                     acts.append("恢复被裁切内容")
                 if pi.fix_rotation is not None:
@@ -1387,6 +1671,8 @@ def _write_report(report: MergeReport, opts: Options) -> Optional[Path]:
     lines.append("恢复裁切：%s" % ("开" if opts.fix_clipping else "关"))
     lines.append("")
     lines.append("输入文件：%d 个（可用 %d 个）" % (report.total_files, report.ok_files))
+    if report.image_files:
+        lines.append("图片材料：%d 个（按「其他材料」处理，一张一页）" % report.image_files)
     lines.append("输入页数：%d" % report.total_pages)
     lines.append("输出页数：%d" % report.written_pages)
     lines.append("处理用时：%.1f 秒" % report.elapsed)
@@ -1419,19 +1705,22 @@ def _write_report(report: MergeReport, opts: Options) -> Optional[Path]:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="invoice_merge",
-        description="发票合并小助手：把多张发票 PDF 合并为一个，自动处理横竖方向与尺寸。",
+        description="发票合并小助手：把多张发票 PDF / 图片合并为一个，自动处理横竖方向与尺寸。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例：\n"
             "  python invoice_merge.py                                  # 打开图形界面\n"
             "  python invoice_merge.py --folder ~/Desktop/发票\n"
             "  python invoice_merge.py --files a.pdf b.pdf -o 合并.pdf\n"
+            "  python invoice_merge.py --files 发票.pdf 车票.jpg -o 合并.pdf\n"
             "  python invoice_merge.py --folder ./发票 --size keep --sort mtime\n"
         ),
     )
     src = p.add_argument_group("输入（二选一）")
-    src.add_argument("--files", nargs="+", metavar="PDF", help="手动指定若干个 PDF 文件")
-    src.add_argument("--folder", metavar="DIR", help="合并该文件夹内的所有 PDF")
+    src.add_argument("--files", nargs="+", metavar="FILE",
+                     help="手动指定若干 PDF 或图片文件"
+                          "（图片支持 jpg/jpeg/png/bmp/tif/tiff/webp/gif/heic/heif）")
+    src.add_argument("--folder", metavar="DIR", help="合并该文件夹内的所有 PDF 与图片")
     src.add_argument("--recursive", action="store_true", help="文件夹模式包含子目录")
 
     out = p.add_argument_group("输出")
@@ -1499,9 +1788,9 @@ def run_cli(argv: Sequence[str]) -> int:
         if not folder.is_dir():
             print("错误：文件夹不存在 %s" % folder, file=sys.stderr)
             return 2
-        files = list_pdfs(folder, args.recursive)
+        files = list_sources(folder, args.recursive)
         if not files:
-            print("错误：该文件夹内没有 PDF 文件", file=sys.stderr)
+            print("错误：该文件夹内没有 PDF 或图片文件", file=sys.stderr)
             return 2
     if args.files:
         files = [Path(f).expanduser() for f in args.files] + files
@@ -1538,8 +1827,9 @@ def run_cli(argv: Sequence[str]) -> int:
             if si.ok:
                 total += si.page_count
                 hit = ("  命中「%s」" % si.category_hit) if si.category_hit else ""
-                print("  [%s] %s  共 %d 页  %s%s"
-                      % (si.category_label, si.path.name, si.page_count,
+                kind = "（图片）" if si.is_image else ""
+                print("  [%s] %s%s  共 %d 页  %s%s"
+                      % (si.category_label, si.path.name, kind, si.page_count,
                          si.orientation_summary(), hit))
                 for pi in si.pages:
                     flags = []
@@ -1651,7 +1941,7 @@ def _build_gui():
             self.var_output = tk.StringVar(value="")
             # 输出路径框里"我们自动填的那个值"，等于它或为空时才允许随材料刷新
             self._auto_output = ""
-            self.var_status = tk.StringVar(value="请选择要合并的 PDF 文件或文件夹")
+            self.var_status = tk.StringVar(value="请选择要合并的 PDF / 图片文件或文件夹")
 
             self._build_widgets()
             self._pump()
@@ -1661,7 +1951,7 @@ def _build_gui():
 
             top = ttk.Frame(self.root, padding=(12, 12, 12, 6))
             top.pack(fill="x")
-            ttk.Button(top, text="选择多个 PDF 文件…", command=self.pick_files).pack(side="left")
+            ttk.Button(top, text="选择多个 PDF / 图片文件…", command=self.pick_files).pack(side="left")
             ttk.Button(top, text="选择一个文件夹…", command=self.pick_folder).pack(side="left", padx=(8, 0))
             ttk.Button(top, text="清空列表", command=self.clear_files).pack(side="left", padx=(8, 0))
             ttk.Button(top, text="移除选中", command=self.remove_selected).pack(side="left", padx=(8, 0))
@@ -1848,9 +2138,12 @@ def _build_gui():
 
         def pick_files(self) -> None:
             paths = filedialog.askopenfilenames(
-                title="选择要合并的 PDF 文件",
+                title="选择要合并的 PDF / 图片文件",
                 initialdir=self._dialog_dir(),
-                filetypes=[("PDF 文件", "*.pdf"), ("所有文件", "*.*")],
+                filetypes=[("发票文件", " ".join("*" + ext for ext in SOURCE_SUFFIXES)),
+                           ("PDF 文件", "*.pdf"),
+                           ("图片", " ".join("*" + ext for ext in IMAGE_SUFFIXES)),
+                           ("所有文件", "*.*")],
             )
             if not paths:
                 return
@@ -1859,18 +2152,19 @@ def _build_gui():
 
         def pick_folder(self) -> None:
             folder = filedialog.askdirectory(
-                title="选择包含发票 PDF 的文件夹",
+                title="选择包含发票 PDF / 图片的文件夹",
                 initialdir=self._dialog_dir(),
             )
             if not folder:
                 return
             fdir = Path(folder)
             self._remember_dir(fdir)
-            pdfs = list_pdfs(fdir, self.var_recursive.get())
-            if not pdfs:
-                messagebox.showwarning("没有找到 PDF", "该文件夹内没有 PDF 文件。\n可勾选「包含子文件夹」后重试。")
+            sources = list_sources(fdir, self.var_recursive.get())
+            if not sources:
+                messagebox.showwarning("没有找到 PDF 或图片",
+                                       "该文件夹内没有 PDF 或图片文件。\n可勾选「包含子文件夹」后重试。")
                 return
-            self._set_files(pdfs, base_dir=fdir)
+            self._set_files(sources, base_dir=fdir)
 
         def clear_files(self) -> None:
             self.files = []
@@ -1878,7 +2172,7 @@ def _build_gui():
             self.base_dir = None
             self._sync_output_path()
             self._refresh_tree()
-            self.var_status.set("请选择要合并的 PDF 文件或文件夹")
+            self.var_status.set("请选择要合并的 PDF / 图片文件或文件夹")
 
         def remove_selected(self) -> None:
             sel = sorted((int(i) for i in self.tree.selection()), reverse=True)
@@ -1974,7 +2268,7 @@ def _build_gui():
             if self.worker and self.worker.is_alive():
                 return
             if not self.files:
-                messagebox.showinfo("还没有文件", "请先选择要合并的 PDF 文件或文件夹。")
+                messagebox.showinfo("还没有文件", "请先选择要合并的 PDF / 图片文件或文件夹。")
                 return
             opts = self._collect_options()
             # 界面上的顺序就是最终输出顺序。用户可能用「上移 / 下移」手动调过，

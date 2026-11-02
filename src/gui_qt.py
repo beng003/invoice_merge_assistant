@@ -600,7 +600,7 @@ class MainWindow(QWidget):
         self.resize(1000, 860)
         self.setMinimumSize(820, 560)      # 有滚动区兜底，窗口小也不会裁字
 
-        # 整个窗口接收拖放：从访达把 PDF / 文件夹直接拖进来即可添加。
+        # 整个窗口接收拖放：从访达把 PDF / 图片 / 文件夹直接拖进来即可添加。
         # 日志框、路径框、表格会默认自己吃掉拖放事件，下面建控件时逐个关掉，
         # 让拖放事件冒泡到窗口统一处理。
         self.setAcceptDrops(True)
@@ -713,7 +713,7 @@ class MainWindow(QWidget):
         col.setSpacing(2)
         title = QLabel("发票合并小助手")
         title.setObjectName("title")
-        sub = QLabel("把多张发票 PDF 合成一个文件，自动处理横竖方向与页面尺寸")
+        sub = QLabel("把多张发票 PDF / 图片合成一个文件，自动处理横竖方向与页面尺寸")
         sub.setObjectName("subtitle")
         col.addWidget(title)
         col.addWidget(sub)
@@ -741,7 +741,7 @@ class MainWindow(QWidget):
         bar.addStretch(1)
         outer.addLayout(bar)
 
-        drag_hint = QLabel("提示：把 PDF 文件或文件夹直接拖进窗口即可添加，一次可拖多个")
+        drag_hint = QLabel("提示：把 PDF / 图片文件或文件夹直接拖进窗口即可添加，一次可拖多个")
         drag_hint.setObjectName("hint")
         outer.addWidget(drag_hint)
 
@@ -850,7 +850,8 @@ class MainWindow(QWidget):
 
         hint = QLabel(
             "整理顺序：酒店发票 → 差旅费报销单 → 火车 / 飞机票据 → 其他材料 → 票据粘贴单封面\n"
-            "拼版：酒店 / 机票两张一页，其他材料三张一转一页，带间画裁切虚线便于裁剪")
+            "拼版：酒店 / 机票两张一页，其他材料三张一转一页，带间画裁切虚线便于裁剪\n"
+            "图片按「其他材料」处理（三张一转、可拼版）")
         hint.setObjectName("hint")
         outer.addWidget(hint)
         return frame
@@ -946,27 +947,28 @@ class MainWindow(QWidget):
     def add_dropped(self, paths: Sequence[Path]) -> None:
         """把拖入的文件 / 文件夹**追加**到材料列表，不覆盖已有内容。
 
-        文件夹按「包含子文件夹」开关展开成 PDF；已在列表里的自动去重；
-        非 PDF 计数跳过，不打断整批添加。只分析新加的文件，旧文件的
+        文件夹按「包含子文件夹」开关展开成 PDF / 图片；已在列表里的自动去重；
+        非 PDF / 图片计数跳过，不打断整批添加。只分析新加的文件，旧文件的
         分析结果沿用。
         """
-        pdfs: List[Path] = []
+        sources: List[Path] = []
         skipped = 0
         for p in paths:
             if p.is_dir():
-                pdfs.extend(core.list_pdfs(p, self.chk_recursive.isChecked()))
-            elif p.suffix.lower() == ".pdf" and p.is_file():
-                pdfs.append(p)
+                sources.extend(core.list_sources(p, self.chk_recursive.isChecked()))
+            elif core.is_source_path(p) and p.is_file():
+                sources.append(p)
             else:
                 skipped += 1
 
         existing = set(self.files)
-        fresh = [p for p in pdfs if p not in existing]
-        dup = len(pdfs) - len(fresh)
+        fresh = [p for p in sources if p not in existing]
+        dup = len(sources) - len(fresh)
 
         if not fresh:
             self.status_label.setText(
-                "所选文件已在列表中" if pdfs else "拖入的内容里没有可用的 PDF")
+                "所选文件已在列表中" if sources
+                else "拖入的内容里没有可用的 PDF 或图片")
             return
 
         self.files.extend(fresh)
@@ -982,7 +984,7 @@ class MainWindow(QWidget):
         if dup:
             msg += "（%d 个已在列表中）" % dup
         if skipped:
-            msg += "，跳过 %d 个非 PDF" % skipped
+            msg += "，跳过 %d 个非 PDF / 图片" % skipped
         self.status_label.setText(msg)
         self.log.appendPlainText("拖入添加 → " + msg)
 
@@ -1040,8 +1042,12 @@ class MainWindow(QWidget):
                     warns = sum(len(p.warnings) for p in si.pages)
                     if warns:
                         notes.append("%d 条提示" % warns)
+                # 图片一律按「其他材料」拼版，方向列直接标出「图片」，方便一眼区分
+                orient = si.orientation_summary()
+                if si.is_image:
+                    orient = "图片·" + orient if orient in ("横向", "纵向") else "图片"
                 cells = [f.name, si.category_label, str(si.page_count),
-                         si.orientation_summary(), size_txt, " ".join(notes)]
+                         orient, size_txt, " ".join(notes)]
             for c, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 if c:
@@ -1055,8 +1061,11 @@ class MainWindow(QWidget):
 
     def pick_files(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "选择要合并的 PDF 文件", self._dialog_dir(),
-            "PDF 文件 (*.pdf);;所有文件 (*)")
+            self, "选择要合并的 PDF / 图片文件", self._dialog_dir(),
+            "发票文件 (*.pdf *.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp *.gif *.heic *.heif)"
+            ";;PDF 文件 (*.pdf)"
+            ";;图片 (*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp *.gif *.heic *.heif)"
+            ";;所有文件 (*)")
         if not paths:
             return
         self._remember_dir(paths[0])
@@ -1064,17 +1073,17 @@ class MainWindow(QWidget):
 
     def pick_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(
-            self, "选择包含发票 PDF 的文件夹", self._dialog_dir())
+            self, "选择包含发票 PDF / 图片的文件夹", self._dialog_dir())
         if not folder:
             return
         fdir = Path(folder)
         self._remember_dir(fdir)
-        pdfs = core.list_pdfs(fdir, self.chk_recursive.isChecked())
-        if not pdfs:
-            QMessageBox.warning(self, "没有找到 PDF",
-                                "该文件夹内没有 PDF 文件。\n可勾选「包含子文件夹」后重试。")
+        sources = core.list_sources(fdir, self.chk_recursive.isChecked())
+        if not sources:
+            QMessageBox.warning(self, "没有找到 PDF 或图片",
+                                "该文件夹内没有 PDF 或图片文件。\n可勾选「包含子文件夹」后重试。")
             return
-        self._set_files(pdfs, base_dir=fdir)
+        self._set_files(sources, base_dir=fdir)
 
     def clear_files(self) -> None:
         self.files = []
@@ -1199,7 +1208,7 @@ class MainWindow(QWidget):
 
     def start_merge(self) -> None:
         if not self.files:
-            QMessageBox.information(self, "还没有材料", "请先选择 PDF 文件或文件夹。")
+            QMessageBox.information(self, "还没有材料", "请先选择 PDF / 图片文件或文件夹。")
             return
         if self.worker is not None and self.worker.isRunning():
             return

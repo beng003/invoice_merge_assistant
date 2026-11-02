@@ -13,7 +13,9 @@ a = Analysis(
     datas=[
         (os.path.join(SRC, 'assets'), 'assets'),
     ],
-    hiddenimports=['tkinter', 'gui_qt'],
+    hiddenimports=['tkinter', 'gui_qt',
+                # HEIC / WebP 解码是延迟 import，静态分析扫不到，必须显式声明
+                'PIL.Image', 'PIL.ImageOps', 'pillow_heif'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
