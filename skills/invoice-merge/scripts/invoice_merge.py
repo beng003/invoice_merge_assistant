@@ -49,7 +49,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 # --------------------------------------------------------------------------
 # 依赖
@@ -171,7 +171,8 @@ OUTPUT_MARKERS = ("_合并_", "发票合并_", "_报告")
 
 # 酒店出具的消费明细，不是税务发票 —— 归「其他材料」，不按酒店那样固定两张一页。
 # 必须优先判定：这类单据正文里通常写着酒店名称，否则会被酒店关键词命中。
-SETTLEMENT_HINTS = ("结账单", "结帐单", "消费明细", "账单明细")
+# 「水单」是携程 / 酒店给的宾客水单（住宿明细），和结账单同性质，一并归入。
+SETTLEMENT_HINTS = ("结账单", "结帐单", "消费明细", "账单明细", "水单")
 
 # 同样归「其他材料」的单据：电子登机凭证只是乘机时打出来的 A4 纸，
 # 出差申请审批单是流程单据，都不是票据本身。必须早于火车 / 飞机关键词判定，
@@ -201,6 +202,17 @@ BAND_LINE_DASHES = "[4 3] 0"
 INK_THRESHOLD = 245                    # 灰度低于该值视为有内容
 EDGE_TOL = 2.0                         # 内容距页边小于该值(pt)视为贴边
 CLIP_TOL = 1.0                         # 内容超出页面超过该值(pt)判定为被裁切
+
+# 内容框里剔除「孤立小碎片」的门槛。典型场景：整页 A4 单据的正文只占上半页，
+# 底部单独一行「第 1 页 / 共 1 页」。若不剔除，墨迹框会被这行 8pt 小字撑满整页，
+# 拼到半页带子里只能缩到 49%，正文小到看不清 —— 用户反馈"下面一小点可以忽略"。
+# 判据必须保守：行距大的稀疏单据（正文各行间也隔着四五十 pt）不能被当成碎片。
+# 所以要求「离主体极远」+「自身又薄又少墨」同时成立，宁可少剔不要误伤。
+INK_ISOLATE_GAP_RATIO = 0.45           # 与主体的垂直间隔超过页高的该比例即视为孤立
+INK_ISOLATE_GAP_MIN = 120.0            # 且至少有这么多 pt 的空白
+INK_TINY_BAND_RATIO = 0.02             # 自身高度不足页高的该比例即视为薄片
+INK_TINY_BAND_MAX = 16.0               # 且绝对高度不超过这么多 pt
+INK_TINY_KEEP_SHARE = 0.15             # 薄片墨量超过主体的该比例就不动它（可能真是内容）
 
 
 # --------------------------------------------------------------------------
@@ -851,6 +863,129 @@ def _ink_box(page, dpi: int) -> Optional[fitz.Rect]:
     return fitz.Rect(minx * scale, miny * scale, (maxx + 1) * scale, (maxy + 1) * scale)
 
 
+def _ink_bands(page, dpi: int) -> Optional[List[Tuple[float, float, float, float, int]]]:
+    """渲染页面后按行切出墨迹带，返回 [(y0, y1, x0, x1, 墨量)]，单位 pt。
+
+    只把「上下相邻、中间没有空白行」的像素算同一条带；带与带之间的空白留给
+    调用方按需合并 —— 一段正常文字的行距会产生很多条带，页脚页码则是单独一条。
+    """
+    try:
+        pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY)
+    except Exception:
+        return None
+    if pix.width <= 0 or pix.height <= 0:
+        return None
+    scale = 72.0 / dpi
+    w, h, stride, samples = pix.width, pix.height, pix.stride, pix.samples
+
+    spans: List[Tuple[int, int]] = []
+    if _np is not None:
+        arr = _np.frombuffer(samples, dtype=_np.uint8).reshape(h, stride)[:, :w]
+        mask = arr < INK_THRESHOLD
+        rows = _np.where(mask.any(axis=1))[0]
+        if len(rows) == 0:
+            return []
+        start = prev = int(rows[0])
+        for r in rows[1:]:
+            r = int(r)
+            if r - prev > 1:
+                spans.append((start, prev))
+                start = r
+            prev = r
+        spans.append((start, prev))
+        bands: List[Tuple[float, float, float, float, int]] = []
+        for a, b in spans:
+            sub = mask[a:b + 1]
+            cols = _np.where(sub.any(axis=0))[0]
+            bands.append((a * scale, (b + 1) * scale,
+                          float(cols[0]) * scale, float(cols[-1] + 1) * scale,
+                          int(sub.sum())))
+        return bands
+
+    # 无 numpy 时的纯 Python 回退
+    for y in range(h):
+        row = samples[y * stride: y * stride + w]
+        if min(row) >= INK_THRESHOLD:
+            continue
+        if spans and y - spans[-1][1] <= 1:
+            spans[-1] = (spans[-1][0], y)
+        else:
+            spans.append((y, y))
+    bands = []
+    for a, b in spans:
+        minx, maxx, area = w, -1, 0
+        for y in range(a, b + 1):
+            row = samples[y * stride: y * stride + w]
+            for x, v in enumerate(row):
+                if v < INK_THRESHOLD:
+                    area += 1
+                    if x < minx:
+                        minx = x
+                    if x > maxx:
+                        maxx = x
+        if maxx < 0:
+            continue
+        bands.append((a * scale, (b + 1) * scale,
+                      minx * scale, (maxx + 1) * scale, area))
+    return bands
+
+
+def _union_band_box(bands) -> fitz.Rect:
+    """把若干条带合成一个外框。"""
+    return fitz.Rect(
+        min(b[2] for b in bands), min(b[0] for b in bands),
+        max(b[3] for b in bands), max(b[1] for b in bands),
+    )
+
+
+def _main_ink_box(page, dpi: int) -> Optional[fitz.Rect]:
+    """内容外框，但剔除与主体隔得很远的极小碎片（页脚页码之类）。
+
+    和 `_ink_box` 的区别只在这一点：`_ink_box` 取全部墨迹的包围盒，适合判断
+    "有没有被裁切"；这里要的是"内容到底占多大"，所以孤立的页码小字不参与。
+    剔除后内容框会变小，拼版时同样的条带能放下更大的成像。
+    """
+    bands = _ink_bands(page, dpi)
+    if bands is None:
+        return None
+    if not bands:
+        return None
+
+    page_h = float(page.rect.height)
+    gap_thr = max(INK_ISOLATE_GAP_MIN, INK_ISOLATE_GAP_RATIO * page_h)
+    tiny_thr = max(INK_TINY_BAND_MAX, INK_TINY_BAND_RATIO * page_h)
+
+    # 按垂直间隔聚类：间隔小于门槛的算同一块内容
+    clusters: List[List[Tuple[float, float, float, float, int]]] = [[bands[0]]]
+    for b in bands[1:]:
+        if b[0] - clusters[-1][-1][1] <= gap_thr:
+            clusters[-1].append(b)
+        else:
+            clusters.append([b])
+
+    if len(clusters) == 1:
+        return _union_band_box(clusters[0])
+
+    main = max(clusters, key=lambda c: sum(b[4] for b in c))
+    main_area = sum(b[4] for b in main) or 1
+    main_top = min(b[0] for b in main)
+    main_bottom = max(b[1] for b in main)
+
+    keep = [main]
+    for c in clusters:
+        if c is main:
+            continue
+        top = min(b[0] for b in c)
+        bottom = max(b[1] for b in c)
+        area = sum(b[4] for b in c)
+        gap = min(abs(top - main_bottom), abs(main_top - bottom))
+        if bottom - top < tiny_thr and area < INK_TINY_KEEP_SHARE * main_area and gap > gap_thr:
+            continue                    # 孤立小碎片：不参与内容框
+        keep.append(c)
+
+    return _union_band_box([b for c in keep for b in c])
+
+
 def _vector_extent(page) -> Optional[fitz.Rect]:
     """页面所有元素（文本 / 图像 / 矢量）在未旋转坐标系下的并集包围盒。
 
@@ -1197,13 +1332,16 @@ def _place_content(page, src_doc, src_page, dst: fitz.Rect,
     正确理解是"几张材料各占纸张的几条带"，而不是"把发票截掉一半"：只去掉四周
     空白，内容一律完整保留；放不下就整张缩小，只是小一点，不丢信息。竖版单据
     横过来通常比硬塞着不转成像更大（A4 竖版进三条带约 47% 对 33%），故两种摆法取大的。
+    唯一的例外是先剔除页脚页码这类孤立小碎片，理由见 _main_ink_box。
     """
-    ink = _ink_box(src_page, 72)
+    ink = _main_ink_box(src_page, 72)
     if ink is None or ink.is_empty:
         page.show_pdf_page(dst, src_doc, 0, keep_proportion=True)
         return 0, 1.0
     # 四周空白都按实际墨迹范围去掉 —— 早先只去上下、保留整页宽，
     # 结果横向留白把内容撑成"宽扁一条"，旋转该不该转就判反了。
+    # 用 _main_ink_box 而不是 _ink_box：底部孤零零的「第 1 页 / 共 1 页」
+    # 会把内容框撑满整页，让正文白白缩掉一半。
     band = ink & src_page.rect
     if band.is_empty or not band.width or not band.height:
         page.show_pdf_page(dst, src_doc, 0, keep_proportion=True)

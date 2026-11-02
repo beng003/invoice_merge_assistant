@@ -1683,6 +1683,99 @@ def main() -> int:
               and any("等比缩小" in a for a in rep_huge.actions),
               "长宽比 %0.3f → %0.3f；%s" % (ratio_in, ratio_out, rep_huge.actions))
 
+    # ================= 用例 Q：类别分页与页脚剔除 =================
+    print()
+    print("-" * 70)
+    print("用例 Q：酒店水单归其他材料、余下带子留白、页脚小字不算内容")
+    print("-" * 70)
+    qdir = workdir / "Q_分页与页脚"
+    qdir.mkdir(exist_ok=True)
+
+    def make_q_hotel(name: str, number: str) -> None:
+        doc = fitz.open()
+        pg = doc.new_page(width=A4_W, height=A4_H)
+        pg.insert_text((60, 90), "电子发票（增值税普通发票）", fontsize=16, fontname="china-s")
+        pg.insert_text((60, 130), "发票号码：%s" % number, fontsize=11, fontname="china-s")
+        pg.insert_text((60, 170), "项目名称：住宿费  维也纳国际酒店", fontsize=11, fontname="china-s")
+        pg.insert_text((60, 210), "价税合计：1366.00 元", fontsize=11, fontname="china-s")
+        doc.save(str(qdir / name))
+        doc.close()
+
+    def make_q_folio(name: str) -> None:
+        """宾客水单：正文写着酒店名，容易被「酒店」关键词抢进酒店发票类。"""
+        doc = fitz.open()
+        pg = doc.new_page(width=A4_W, height=A4_H)
+        pg.insert_text((60, 90), "宾客水单", fontsize=16, fontname="china-s")
+        pg.insert_text((60, 130), "酒店名称：桔子酒店乌鲁木齐二宫体育馆店", fontsize=11, fontname="china-s")
+        pg.insert_text((60, 170), "总金额 623.76", fontsize=11, fontname="china-s")
+        doc.save(str(qdir / name))
+        doc.close()
+
+    def make_q_footer(name: str) -> None:
+        """正文只占上半页，页脚一行小字贴在最底 —— 早先这行把内容框撑满整页。"""
+        doc = fitz.open()
+        pg = doc.new_page(width=A4_W, height=A4_H)
+        pg.insert_text((60, 90), "航旅纵横 - 行程校验单", fontsize=15, fontname="china-s")
+        pg.insert_text((60, 130), "票价 2410.00  航段 济南 - 乌鲁木齐", fontsize=11, fontname="china-s")
+        pg.insert_text((60, 165), "备注：本单由航旅纵横出具，可扫码验真", fontsize=11, fontname="china-s")
+        pg.insert_text((A4_W / 2 - 34, A4_H - 16), "第 1 页/共 1 页", fontsize=8, fontname="china-s")
+        doc.save(str(qdir / name))
+        doc.close()
+
+    make_q_folio("桔子酒店宾客水单.pdf")
+    folio = im.analyze_source(qdir / "桔子酒店宾客水单.pdf", im.Options())
+    check("Q1 宾客水单不算酒店发票，归其他材料（与结账单同口径）",
+          folio.ok and folio.category == im.CATEGORY_OTHER,
+          "类别=%s 命中=%s" % (folio.category, folio.category_hit))
+
+    for i in (1, 2, 3):
+        make_q_hotel("酒店发票%d.pdf" % i, "26112000003833356%03d" % i)
+    rep_q2 = im.merge_pdfs(
+        im.sort_paths([qdir / ("酒店发票%d.pdf" % i) for i in (1, 2, 3)], im.SORT_NATURAL),
+        im.Options(scan_output=False, output=qdir / "Q_三张酒店发票.pdf"),
+        log=lambda _m: None)
+    inks_q2 = []
+    if rep_q2.ok:
+        d_q2 = fitz.open(str(rep_q2.output))
+        inks_q2 = [im._ink_box(pg, 72) for pg in d_q2]
+        d_q2.close()
+    check("Q2 三张酒店发票排两页：第三张独占半页，下半页留白不塞别的材料",
+          len(inks_q2) == 2 and inks_q2[1] is not None
+          and inks_q2[1].y1 < A4_H * 0.55,
+          "页数=%d 第2页内容底边=%s（页高 %.0f）"
+          % (len(inks_q2),
+             "%.0f" % inks_q2[1].y1 if len(inks_q2) > 1 and inks_q2[1] else "-", A4_H))
+
+    make_q_footer("行程校验单_带页脚.pdf")
+    doc_q3 = im._open_source(qdir / "行程校验单_带页脚.pdf")
+    raw_q3 = im._ink_box(doc_q3[0], 72)
+    main_q3 = im._main_ink_box(doc_q3[0], 72)
+    doc_q3.close()
+    check("Q3 孤立页脚不计入内容框（框明显变矮，上边界不动）",
+          raw_q3 is not None and main_q3 is not None
+          and main_q3.height < raw_q3.height * 0.6
+          and abs(main_q3.y0 - raw_q3.y0) < 2,
+          "原框高 %.0f → 新框高 %.0f"
+          % (raw_q3.height if raw_q3 else -1, main_q3.height if main_q3 else -1))
+
+    make_q_footer("行程校验单_带页脚2.pdf")
+    rep_q = im.merge_pdfs(
+        [qdir / "行程校验单_带页脚.pdf", qdir / "行程校验单_带页脚2.pdf"],
+        im.Options(scan_output=False, output=qdir / "Q_页脚拼版.pdf"),
+        log=lambda _m: None)
+    shrunk = [w for _s, w in rep_q.warnings if "内容放不下" in w]
+    ink_w = 0.0
+    if rep_q.ok:
+        d_q = fitz.open(str(rep_q.output))
+        ink_q = im._ink_box(d_q[0], 72)
+        ink_w = ink_q.width if ink_q else 0.0
+        d_q.close()
+    band_w = A4_W - 2 * im.BAND_INSET_MM * im.MM
+    check("Q4 带页脚的整页单据拼进半页不再被压到 49%（按正文取框、铺满带子）",
+          rep_q.ok and not shrunk and ink_w >= band_w * 0.85,
+          "缩放告警=%s 内容宽 %.0fpt / 带子宽 %.0fpt"
+          % (shrunk or "无", ink_w, band_w))
+
     # ================= 结果 =================
     print()
     print("=" * 70)
