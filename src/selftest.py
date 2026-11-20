@@ -1872,16 +1872,23 @@ def main() -> int:
     # 整页表单（出差审批单）挤进 1/3 条带只剩 69%，横着还空掉一半宽度。
     # 同页有它时，按原大给它一条更高的带子，剩下的高度分给其它材料。
     def make_q_approval(name: str) -> None:
-        """A4 表单：内容 501×356pt，宽高比 1.41 —— 与真实出差审批单同形。"""
+        """A4 表单：正文 501×207pt，下半页铺满极淡的斜向水印 —— 与真实审批单同形。
+
+        真件在表格下方一路排着「20258604 王新龙 2026/11/09 10:07」的浅灰水印，
+        按「有墨就是内容」算，内容框会被撑到整页，正文只好缩到 69% 还留一片空白。
+        """
         doc = fitz.open()
         pg = doc.new_page(width=A4_W, height=A4_H)
-        pg.draw_rect(fitz.Rect(46, 46, 547, 402), color=(0, 0, 0), width=1.2)
+        pg.draw_rect(fitz.Rect(46, 46, 547, 253), color=(0, 0, 0), width=1.2)
         pg.insert_text((70, 90), "国核信息-出差申请审批单",
                        fontsize=14, fontname="china-s")
         pg.insert_text((70, 130), "出差人员 王新龙   出差地点 北京市",
                        fontsize=11, fontname="china-s")
         pg.insert_text((70, 170), "出差天数 3   交通工具 高铁",
                        fontsize=11, fontname="china-s")
+        for i in range(5):                       # 极淡水印：0.87 灰 ≈ 222
+            pg.insert_text((70 + (i % 2) * 180, 300 + i * 100), "20258604 王新龙",
+                           fontsize=13, fontname="china-s", color=(0.87, 0.87, 0.87))
         doc.save(str(qdir / name))
         doc.close()
 
@@ -1914,15 +1921,38 @@ def main() -> int:
     ys_q8 = cut_lines(rep_q8.output, 0) if rep_q8.ok else []
     appr_warn = [w for n, w in rep_q8.warnings
                  if "出差审批单" in n and "内容放不下" in w]
-    top_q8 = ink_rows(rep_q8.output, 0, 0, 380) if rep_q8.ok else (-1, -1)
+    # 表单占用的那条带子到第一条虚线为止，量到那里就行（别把下一条带子的墨迹算进来）
+    band1_bottom = (ys_q8[0] - 5) if ys_q8 else 380
+    top_q8 = ink_rows(rep_q8.output, 0, 0, band1_bottom) if rep_q8.ok else (-1, -1)
     check("Q8 整页表单不再压到 69%：按原大（约 100%）占一条更高的带子",
           rep_q8.ok and not appr_warn and 0 < top_q8[0] < 80
-          and abs((top_q8[1] - top_q8[0]) - 356) < 6,
-          "告警=%s 表单实际高 %.0fpt（源内容 356pt）"
+          and abs((top_q8[1] - top_q8[0]) - 207) < 6,
+          "告警=%s 表单实际高 %.0fpt（源正文 207pt）"
           % (appr_warn or "无", top_q8[1] - top_q8[0]))
-    check("Q9 同页其它材料分剩下的高度：第一条虚线被推到 1/3 页之下",
-          len(ys_q8) == 2 and ys_q8[0] > A4_H / 3 + 10,
-          "虚线 y=%s" % ys_q8)
+    check("Q9 同页其它材料分剩下的高度：两条虚线不再落在 1/3、2/3 三等分处",
+          len(ys_q8) == 2
+          and abs(ys_q8[0] - A4_H / 3) > 15 and abs(ys_q8[1] - A4_H * 2 / 3) > 15,
+          "虚线 y=%s（等分应是 %.0f、%.0f）"
+          % (ys_q8, A4_H / 3, A4_H * 2 / 3))
+
+    # 极淡水印不能算内容：内容框止于正文，否则整页被撑满、正文被动缩小
+    doc_q10 = fitz.open()
+    pg = doc_q10.new_page(width=A4_W, height=A4_H)
+    pg.draw_rect(fitz.Rect(46, 46, 547, 253), color=(0, 0, 0), width=1.2)
+    pg.insert_text((70, 90), "出差申请审批单", fontsize=14, fontname="china-s")
+    for i in range(5):
+        pg.insert_text((70 + (i % 2) * 180, 300 + i * 100), "20258604 王新龙",
+                       fontsize=13, fontname="china-s", color=(0.87, 0.87, 0.87))
+    doc_q10.save(str(qdir / "01_带水印的表单.pdf"))
+    doc_q10.close()
+    watermark_pg = fitz.open(str(qdir / "01_带水印的表单.pdf"))[0]
+    raw_wm = im._ink_box(watermark_pg, 72)
+    main_wm = im._main_ink_box(watermark_pg, 72)
+    check("Q10 极淡的斜向水印不算内容：内容框止于正文，不被水印撑到页底",
+          raw_wm is not None and main_wm is not None
+          and raw_wm.height > 550 and abs(main_wm.height - 207) < 8,
+          "全墨迹高 %.0fpt（含水印）→ 内容框高 %.0fpt（正文 207pt）"
+          % (raw_wm.height if raw_wm else -1, main_wm.height if main_wm else -1))
 
     # ================= 用例 R：其他材料内部同类型归拢 =================
     print()

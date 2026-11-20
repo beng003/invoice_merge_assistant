@@ -49,7 +49,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.2.5"
+__version__ = "1.2.6"
 
 # --------------------------------------------------------------------------
 # 依赖
@@ -212,6 +212,13 @@ BAND_LINE_WIDTH = 0.7
 BAND_LINE_DASHES = "[4 3] 0"
 
 INK_THRESHOLD = 245                    # 灰度低于该值视为有内容
+# 「极淡墨迹」的门槛：整条带上最深的像素都还比这亮，就只当它是水印 / 底纹，
+# 不算内容。典型场景是系统导出的审批单、证明文件，正文只占上半页，下半页铺满
+# 「20258604 王新龙 2026/11/09 10:07」这类极淡的斜向水印（实测灰度 217 起）——
+# 按 INK_THRESHOLD 算会把内容框撑满整页，拼版时正文白白缩掉三成、下面留一大片
+# 什么也没有的空白。正常文字的灰度都在 200 以下（黑字 0 起），200 这条线很安全；
+# 一页里全是浅色时所有带子都会被剔掉，调用方按「没法判断」退回整页处理，不会误裁。
+LIGHT_INK_LUMA = 200                   # 灰度 >= 该值的带子视为水印/底纹，不计入内容框
 EDGE_TOL = 2.0                         # 内容距页边小于该值(pt)视为贴边
 CLIP_TOL = 1.0                         # 内容超出页面超过该值(pt)判定为被裁切
 
@@ -926,10 +933,11 @@ def _ink_box(page, dpi: int) -> Optional[fitz.Rect]:
 
 
 def _ink_bands(page, dpi: int) -> Optional[List[Tuple[float, float, float, float, int]]]:
-    """渲染页面后按行切出墨迹带，返回 [(y0, y1, x0, x1, 墨量)]，单位 pt。
+    """渲染页面后按行切出墨迹带，返回 [(y0, y1, x0, x1, 墨量, 最深灰度)]，单位 pt。
 
     只把「上下相邻、中间没有空白行」的像素算同一条带；带与带之间的空白留给
     调用方按需合并 —— 一段正常文字的行距会产生很多条带，页脚页码则是单独一条。
+    最后一项是该带最深的灰度，供 _main_ink_box 区分正文与极淡的水印底纹。
     """
     try:
         pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY)
@@ -955,13 +963,14 @@ def _ink_bands(page, dpi: int) -> Optional[List[Tuple[float, float, float, float
                 start = r
             prev = r
         spans.append((start, prev))
-        bands: List[Tuple[float, float, float, float, int]] = []
+        bands: List[Tuple[float, float, float, float, int, int]] = []
         for a, b in spans:
             sub = mask[a:b + 1]
             cols = _np.where(sub.any(axis=0))[0]
+            vals = arr[a:b + 1][sub]
             bands.append((a * scale, (b + 1) * scale,
                           float(cols[0]) * scale, float(cols[-1] + 1) * scale,
-                          int(sub.sum())))
+                          int(sub.sum()), int(vals.min())))
         return bands
 
     # 无 numpy 时的纯 Python 回退
@@ -975,12 +984,14 @@ def _ink_bands(page, dpi: int) -> Optional[List[Tuple[float, float, float, float
             spans.append((y, y))
     bands = []
     for a, b in spans:
-        minx, maxx, area = w, -1, 0
+        minx, maxx, area, dark = w, -1, 0, 255
         for y in range(a, b + 1):
             row = samples[y * stride: y * stride + w]
             for x, v in enumerate(row):
                 if v < INK_THRESHOLD:
                     area += 1
+                    if v < dark:
+                        dark = v
                     if x < minx:
                         minx = x
                     if x > maxx:
@@ -988,7 +999,7 @@ def _ink_bands(page, dpi: int) -> Optional[List[Tuple[float, float, float, float
         if maxx < 0:
             continue
         bands.append((a * scale, (b + 1) * scale,
-                      minx * scale, (maxx + 1) * scale, area))
+                      minx * scale, (maxx + 1) * scale, area, dark))
     return bands
 
 
@@ -1006,12 +1017,21 @@ def _main_ink_box(page, dpi: int) -> Optional[fitz.Rect]:
     和 `_ink_box` 的区别只在这一点：`_ink_box` 取全部墨迹的包围盒，适合判断
     "有没有被裁切"；这里要的是"内容到底占多大"，所以孤立的页码小字不参与。
     剔除后内容框会变小，拼版时同样的条带能放下更大的成像。
+
+    第二条剔除规则：整条带上最深的像素都还比 LIGHT_INK_LUMA 亮，说明这一条只有
+    水印 / 底纹，不是正文。系统导出的审批单、证明文件常在下半页铺满极淡的斜向
+    水印，按"有墨就是内容"算会把框撑到整页，正文被压小、下面留一大片空白。
     """
     bands = _ink_bands(page, dpi)
     if bands is None:
         return None
     if not bands:
         return None
+    # 只有水印/底纹的带子不算内容：一排排浅色斜字能把内容框一路撑到页底
+    solid = [b for b in bands if b[5] < LIGHT_INK_LUMA]
+    if not solid:
+        return None                  # 整页都是浅色（可能是曝光过度的扫描），退回别处判断
+    bands = solid
 
     page_h = float(page.rect.height)
     gap_thr = max(INK_ISOLATE_GAP_MIN, INK_ISOLATE_GAP_RATIO * page_h)
