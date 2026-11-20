@@ -1728,6 +1728,39 @@ def main() -> int:
           folio.ok and folio.category == im.CATEGORY_OTHER,
           "类别=%s 命中=%s" % (folio.category, folio.category_hit))
 
+    def make_q_folio_scan(name: str) -> None:
+        """酒店前台打印的水单扫描件：整页只有图像、没有文字层，只能凭文件名归类。
+
+        文件名形如「04_住宿账单_…_8607房_1晚_419.09元.pdf」——「住宿」二字曾经把它
+        直接送进酒店发票类，跟前一晚的住宿发票拼到同一页上。
+        """
+        doc = fitz.open()
+        pg = doc.new_page(width=A4_W, height=A4_H)
+        pg.draw_rect(fitz.Rect(60, 60, A4_W - 60, 250),
+                     color=(0, 0, 0), fill=(0.92, 0.92, 0.92))
+        pg.draw_rect(fitz.Rect(60, 270, A4_W - 60, 430), color=(0, 0, 0))
+        doc.save(str(qdir / name))
+        doc.close()
+
+    folio_scan_name = "04_住宿账单_20261104-20261105_8607房_1晚_419.09元.pdf"
+    make_q_folio_scan(folio_scan_name)
+    folio_scan = im.analyze_source(qdir / folio_scan_name, im.Options())
+    check("Q1a 无文字层的水单扫描件（只能看文件名）也归其他材料，不当酒店发票",
+          folio_scan.ok and folio_scan.category == im.CATEGORY_OTHER
+          and im.other_subtype(folio_scan) == "消费明细",
+          "类别=%s 命中=%s 小类=%s"
+          % (folio_scan.category, folio_scan.category_hit,
+             (im.other_subtype(folio_scan) or "-") if folio_scan.ok else "-"))
+    check("Q1b 文件名带「账单」但确实是发票的，仍归酒店发票",
+          im.classify_document("住宿账单发票.pdf")[0] == im.CATEGORY_HOTEL
+          and im.classify_document(
+              "04.pdf", "电子发票（增值税普通发票） 项目：住宿费 备注：账单见附件")[0]
+          == im.CATEGORY_HOTEL,
+          "文件名带发票=%s 正文带发票=%s"
+          % (im.classify_document("住宿账单发票.pdf"),
+             im.classify_document("04.pdf",
+                 "电子发票（增值税普通发票） 项目：住宿费 备注：账单见附件")))
+
     for i in (1, 2, 3):
         make_q_hotel("酒店发票%d.pdf" % i, "26112000003833356%03d" % i)
     rep_q2 = im.merge_pdfs(

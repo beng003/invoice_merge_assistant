@@ -49,7 +49,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.2.3"
+__version__ = "1.2.4"
 
 # --------------------------------------------------------------------------
 # 依赖
@@ -172,7 +172,11 @@ OUTPUT_MARKERS = ("_合并_", "发票合并_", "_报告")
 # 酒店出具的消费明细，不是税务发票 —— 归「其他材料」，不按酒店那样固定两张一页。
 # 必须优先判定：这类单据正文里通常写着酒店名称，否则会被酒店关键词命中。
 # 「水单」是携程 / 酒店给的宾客水单（住宿明细），和结账单同性质，一并归入。
-SETTLEMENT_HINTS = ("结账单", "结帐单", "消费明细", "账单明细", "水单")
+# 「账单」单列：酒店前台打印的水单常存成扫描件（没有文字层），文件名叫
+# 「04_住宿账单_…_8607房_1晚_419.09元.pdf」，只能靠文件名判断；名字里带「住宿」
+# 会被酒店关键词抢走，于是被当成第二张酒店发票跟前一晚的发票拼在一页上。
+# 「发票」二字仍然排除在外，所以「住宿账单发票.pdf」这种真发票不受影响。
+SETTLEMENT_HINTS = ("结账单", "结帐单", "消费明细", "账单", "水单")
 
 # 同样归「其他材料」的单据：电子登机凭证只是乘机时打出来的 A4 纸，
 # 出差申请审批单是流程单据，都不是票据本身。必须早于火车 / 飞机关键词判定，
@@ -473,8 +477,11 @@ def classify_document(name: str, text: str = "") -> Tuple[str, str]:
     """
     haystack = ("%s\n%s" % (name, text)).lower()
 
-    if any(hint in haystack for hint in SETTLEMENT_HINTS) and "发票" not in haystack:
-        return CATEGORY_OTHER, "结账单（非发票）"
+    if "发票" not in haystack:
+        # 标语里带上真正命中的那个词，报告里才看得出是"结账单"还是"账单"认出来的
+        for hint in SETTLEMENT_HINTS:
+            if hint in haystack:
+                return CATEGORY_OTHER, "%s（非发票）" % hint
 
     if any(hint in haystack for hint in VERIFY_HINTS) and "发票" not in haystack:
         return CATEGORY_OTHER, "行程校验单（非发票）"
