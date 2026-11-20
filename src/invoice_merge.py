@@ -49,7 +49,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.2.4"
+__version__ = "1.2.5"
 
 # --------------------------------------------------------------------------
 # 依赖
@@ -1313,19 +1313,75 @@ def _open_cached(cache: Dict[Path, object], path: Path):
     return doc
 
 
-def _band_rects(tw: float, th: float, bands: int,
-                margin: float) -> List[fitz.Rect]:
-    """把纸张纵向等分成 bands 条，返回每条的可用区域。
+def _band_rects(tw: float, th: float, bands: int, margin: float,
+                heights: Optional[Sequence[float]] = None) -> List[fitz.Rect]:
+    """把纸张纵向分成 bands 条，返回每条的可用区域。
+
+    默认等分；给了 heights（每条内容区的高度，pt，已扣掉条带之间的通道）就按
+    这份高度排 —— 「整页表单」占一条高的带子，同页的其它材料分剩下的高度。
 
     每条四周留 BAND_INSET_MM（不小于页边留白 margin）的呼吸空间，相邻两条
     因此空出两倍距离，裁切虚线正走在这条通道中间。
     """
     pad = max(margin, BAND_INSET_MM * MM)
-    band_h = th / bands
     x0, x1 = pad, max(pad + 1.0, tw - pad)
-    return [fitz.Rect(x0, i * band_h + pad, x1, max(i * band_h + pad + 1.0,
-                                                    (i + 1) * band_h - pad))
-            for i in range(bands)]
+    if heights is None:
+        band_h = th / bands
+        return [fitz.Rect(x0, i * band_h + pad, x1, max(i * band_h + pad + 1.0,
+                                                        (i + 1) * band_h - pad))
+                for i in range(bands)]
+    rects: List[fitz.Rect] = []
+    y = pad
+    for h in heights:
+        h = max(1.0, h)
+        rects.append(fitz.Rect(x0, y, x1, y + h))
+        y += h + 2 * pad
+    return rects
+
+
+def _content_size(page) -> Tuple[float, float]:
+    """页面上实际墨迹的宽高（pt），与拼版取框同口径。"""
+    ink = _main_ink_box(page, 72)
+    if ink is None or ink.is_empty:
+        return page.rect.width, page.rect.height
+    box = ink & page.rect
+    if box.is_empty or not box.width or not box.height:
+        return page.rect.width, page.rect.height
+    return box.width, box.height
+
+
+def _form_band_heights(unit: Sequence[Tuple["SourceInfo", PageInfo]],
+                       sizes: Sequence[Tuple[float, float]],
+                       th: float, margin: float) -> Optional[List[float]]:
+    """同一页里混着「整页表单」时，给每条带分配高度；没有就返回 None（等分）。
+
+    出差审批单这类 A4 表单单张就是半页宽的表格，三条带等分时只能缩到 69%：
+    表单宽高比 1.4，条带 2.3，宽度空出来一半，而高度先到顶 —— 空着的纸没处
+    可用。所以给它按原大（1:1）留足高度，剩下的高度再按各材料的内容高度分给
+    其余材料。表单看着仍是「一页的三分之一上下」，同页别的东西只让出一点。
+
+    只认「出差审批单」这一小类：水单、校验单、订单截图没有必须原大的理由，
+    等分最省事，也免得同类材料之间互相挤。一页里有两张以上审批单时同样走等分
+    —— 三张表单抢一条高带子，只会把每张都压得更小。
+    """
+    if len(unit) < 2:
+        return None
+    forms = [i for i, (si, _pi) in enumerate(unit) if other_subtype(si) == "出差审批单"]
+    if len(forms) != 1:
+        return None
+    pad = max(margin, BAND_INSET_MM * MM)
+    avail = th - 2 * pad - (len(unit) - 1) * 2 * pad
+    # 表单一般是横躺的（宽 > 高）；竖版单据进带子时会转 90°，高度取它的宽
+    wanted = [h if w >= h else w for w, h in sizes]
+    take: Dict[int, float] = {}
+    for i in forms:
+        take[i] = min(wanted[i], avail * 0.55)
+    rest = max(0.0, avail - sum(take.values()))
+    others = [i for i in range(len(unit)) if i not in take]
+    total = sum(wanted[i] for i in others) or 1.0
+    return [take[i] if i in take else rest * wanted[i] / total
+            for i in range(len(unit))]
+
 
 
 def band_policy(category: str) -> Optional[Tuple[int, int, bool]]:
@@ -1436,15 +1492,18 @@ def _place_content(page, src_doc, src_page, dst: fitz.Rect,
     return rot, scale
 
 
-def _draw_cut_lines(page, bands: int, margin: float) -> None:
-    """在相邻条带之间的通道正中画裁切虚线，两端离纸边留一段方便下剪子。"""
-    if bands < 2:
+def _draw_cut_lines(page, rects: Sequence[fitz.Rect], margin: float) -> None:
+    """在相邻条带之间的通道正中画裁切虚线，两端离纸边留一段方便下剪子。
+
+    条带高度可以不相等（「整页表单」占一条高的），所以界线按相邻两条的
+    实际边界算，不能再用 i * 页高 / 条数。
+    """
+    if len(rects) < 2:
         return
-    tw, th = page.rect.width, page.rect.height
+    tw = page.rect.width
     inset = max(margin, BAND_INSET_MM * MM)
-    band_h = th / bands
-    for i in range(1, bands):
-        y = i * band_h
+    for above, below in zip(rects, rects[1:]):
+        y = (above.y1 + below.y0) / 2
         page.draw_line(fitz.Point(inset, y), fitz.Point(tw - inset, y),
                        color=BAND_LINE_COLOR, width=BAND_LINE_WIDTH,
                        dashes=BAND_LINE_DASHES)
@@ -1459,33 +1518,46 @@ def _write_band_unit(
     doc_cache: Dict[Path, object],
     margin: float,
 ) -> None:
-    """把一组小材料纵向排进同一张纸的等高条带里，条带间画裁切虚线。
+    """把一组小材料纵向排进同一张纸的条带里，条带间画裁切虚线。
+
+    条带默认等高；同页有「整页表单」（出差审批单）时，那张按原大占更高的一条，
+    其余材料分剩下的高度，理由见 _form_band_heights。
 
     allow_rotate 为假时固定按页面的自然方向取内容，不套用横向页旋转 90° 的规则：
     票据本是宽扁的一条，上下叠放正好，转成竖躺反而浪费纸。
     """
     tw, th = A4_W, A4_H        # 拼版只在统一 A4 纵向模式下发生
     newpage = out.new_page(width=tw, height=th)
-    rects = _band_rects(tw, th, bands, margin)
 
-    for idx, (si, pi) in enumerate(unit):
-        doc = _open_cached(doc_cache, si.path)
-        tmp = fitz.open()
-        try:
+    # 先备好每页的临时文档并量出内容尺寸：要不要给某一条带加高，得先知道
+    # 每份材料有多大。临时文档留着给下面直接用，别为量尺寸再排一遍版。
+    tmps: List[fitz.Document] = []
+    sizes: List[Tuple[float, float]] = []
+    try:
+        for si, pi in unit:
+            doc = _open_cached(doc_cache, si.path)
+            tmp = fitz.open()
             tmp.insert_pdf(doc, from_page=pi.page_no, to_page=pi.page_no)
             tp = tmp[0]
             if pi.new_crop:
                 tp.set_cropbox(fitz.Rect(*pi.new_crop))
             tp.remove_rotation()             # 烘焙旋转，坐标即以视觉呈现为准
+            tmps.append(tmp)
+            sizes.append(_content_size(tp))
 
-            _rot, scale = _place_content(newpage, tmp, tp, rects[idx], allow_rotate)
+        rects = _band_rects(tw, th, bands, margin,
+                            _form_band_heights(unit, sizes, th, margin))
+        for idx, (si, pi) in enumerate(unit):
+            _rot, scale = _place_content(newpage, tmps[idx], tmps[idx][0],
+                                         rects[idx], allow_rotate)
             if scale < 1.0 - 1e-6:
                 pi.warnings.append(
-                    "内容放不下 1/%d 页，已缩小到约 %d%%" % (bands, round(scale * 100)))
-        finally:
+                    "内容放不下这条带子，已缩小到约 %d%%" % round(scale * 100))
+    finally:
+        for tmp in tmps:
             tmp.close()
 
-    _draw_cut_lines(newpage, bands, margin)
+    _draw_cut_lines(newpage, rects, margin)
 
 
 def rasterize_pages(src, dpi: int):

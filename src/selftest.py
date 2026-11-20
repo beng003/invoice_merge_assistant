@@ -1869,6 +1869,61 @@ def main() -> int:
           mix_q.ok and mix_q.category == im.CATEGORY_TRAVEL,
           "类别=%s 命中=%s" % (mix_q.category, mix_q.category_hit))
 
+    # 整页表单（出差审批单）挤进 1/3 条带只剩 69%，横着还空掉一半宽度。
+    # 同页有它时，按原大给它一条更高的带子，剩下的高度分给其它材料。
+    def make_q_approval(name: str) -> None:
+        """A4 表单：内容 501×356pt，宽高比 1.41 —— 与真实出差审批单同形。"""
+        doc = fitz.open()
+        pg = doc.new_page(width=A4_W, height=A4_H)
+        pg.draw_rect(fitz.Rect(46, 46, 547, 402), color=(0, 0, 0), width=1.2)
+        pg.insert_text((70, 90), "国核信息-出差申请审批单",
+                       fontsize=14, fontname="china-s")
+        pg.insert_text((70, 130), "出差人员 王新龙   出差地点 北京市",
+                       fontsize=11, fontname="china-s")
+        pg.insert_text((70, 170), "出差天数 3   交通工具 高铁",
+                       fontsize=11, fontname="china-s")
+        doc.save(str(qdir / name))
+        doc.close()
+
+    def ink_rows(path, page_no: int, y0: float, y1: float, dpi: int = 100):
+        """量某段纵带上墨迹的上下边界（pt），用来核对实际成像高度。"""
+        doc = fitz.open(str(path))
+        try:
+            pix = doc[page_no].get_pixmap(dpi=dpi, colorspace=fitz.csGRAY)
+            if np is None:
+                return -1.0, -1.0
+            a = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+                pix.height, pix.stride)[:, : pix.width]
+            sc = dpi / 72.0
+            seg = a[int(y0 * sc):int(y1 * sc)]
+            rows = np.nonzero((seg < im.INK_THRESHOLD).any(axis=1))[0]
+            if len(rows) == 0:
+                return -1.0, -1.0
+            return y0 + rows.min() / sc, y0 + rows.max() / sc
+        finally:
+            doc.close()
+
+    make_q_approval("01_出差审批单_X.pdf")
+    make_q_folio_scan("02_住宿账单_A.pdf")
+    make_q_folio_scan("03_住宿账单_B.pdf")
+    rep_q8 = im.merge_pdfs(
+        [qdir / "01_出差审批单_X.pdf", qdir / "02_住宿账单_A.pdf",
+         qdir / "03_住宿账单_B.pdf"],
+        im.Options(scan_output=False, output=qdir / "Q_整页表单拼版.pdf"),
+        log=lambda _m: None)
+    ys_q8 = cut_lines(rep_q8.output, 0) if rep_q8.ok else []
+    appr_warn = [w for n, w in rep_q8.warnings
+                 if "出差审批单" in n and "内容放不下" in w]
+    top_q8 = ink_rows(rep_q8.output, 0, 0, 380) if rep_q8.ok else (-1, -1)
+    check("Q8 整页表单不再压到 69%：按原大（约 100%）占一条更高的带子",
+          rep_q8.ok and not appr_warn and 0 < top_q8[0] < 80
+          and abs((top_q8[1] - top_q8[0]) - 356) < 6,
+          "告警=%s 表单实际高 %.0fpt（源内容 356pt）"
+          % (appr_warn or "无", top_q8[1] - top_q8[0]))
+    check("Q9 同页其它材料分剩下的高度：第一条虚线被推到 1/3 页之下",
+          len(ys_q8) == 2 and ys_q8[0] > A4_H / 3 + 10,
+          "虚线 y=%s" % ys_q8)
+
     # ================= 用例 R：其他材料内部同类型归拢 =================
     print()
     print("-" * 70)
